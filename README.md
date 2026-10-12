@@ -1,7 +1,7 @@
 # openai_image_mcp_local
 
 [openai_image_mcp](https://github.com/sggim00/openai_image_mcp)의 **로컬(stdio) 버전**입니다.
-Render 같은 호스팅 없이 내 PC에서 Python으로 돌고, Claude Desktop / Claude Code가 직접 실행합니다.
+별도 서버 없이 내 PC에서 Python으로 돌고, Claude Desktop / Claude Code가 직접 실행합니다.
 
 ```
 사용자 ─ "D:\ref\girl.png 디즈니풍 A포즈로" ─▶ Claude ─ generate_image ─▶ server.py(내 PC) ─▶ OpenAI Images API
@@ -10,12 +10,11 @@ Render 같은 호스팅 없이 내 PC에서 Python으로 돌고, Claude Desktop 
 
 ## 원격 버전과 차이
 
-| | openai_image_mcp (Render) | openai_image_mcp_local |
+| | openai_image_mcp (원격 HTTP) | openai_image_mcp_local |
 |---|---|---|
-| 실행 위치 | Render 서버 | 내 PC (stdio) |
-| 레퍼런스 이미지 | 업로드 페이지 → 코드 | **파일 경로 / 클립보드 / 코드 / URL** 직접 |
-| 결과 저장 | 서버 디스크(무료 플랜은 재시작 시 삭제) | `OUTPUT_DIR` 로컬 폴더 (영구) |
-| 슬립·콜드스타트 | 있음 | 없음 |
+| 실행 위치 | 외부에서 접근 가능한 서버 (직접 호스팅) | 내 PC (stdio) |
+| 레퍼런스 이미지 | 업로드 페이지·구글 드라이브 → 코드 | **파일 경로 / 클립보드 / 코드 / URL** 직접 |
+| 결과 저장 | 서버 디스크 + 구글 드라이브(선택) | `OUTPUT_DIR` 로컬 폴더 |
 | 사용 가능한 곳 | claude.ai 웹·모바일·데스크톱 | **Claude Desktop 앱, Claude Code** (모바일 X) |
 
 ## 설치 (Windows)
