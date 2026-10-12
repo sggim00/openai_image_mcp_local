@@ -22,7 +22,7 @@ Render 같은 호스팅 없이 내 PC에서 Python으로 돌고, Claude Desktop 
 
 1. Python 3.10 이상 설치
 2. 이 폴더에서 `install.bat` 실행 → `.venv` 생성 + 패키지 설치 + `.env` 생성
-3. `.env`에 `OPENAI_API_KEY=sk-...` 입력 (필요하면 `OUTPUT_DIR`도)
+3. `.env`에 키 지정 — 직접 `OPENAI_API_KEY=sk-...` 또는 키 파일 경로 `OPENAI_API_KEY_FILE=D:/.../xxx.api_key` (필요하면 `OUTPUT_DIR`도)
 4. 스크립트가 출력한 블록을 `%APPDATA%\Claude\claude_desktop_config.json`에 추가:
 
 ```json
@@ -36,7 +36,8 @@ Render 같은 호스팅 없이 내 PC에서 Python으로 돌고, Claude Desktop 
 }
 ```
 
-키를 `.env` 대신 설정 파일에 넣고 싶으면 `"env": {"OPENAI_API_KEY": "sk-...", "OUTPUT_DIR": "D:/work/ai_images"}`를 추가하세요.
+`.env` 대신 설정 파일에 넣고 싶으면 `"env": {"OPENAI_API_KEY_FILE": "D:/.../xxx.api_key", "OUTPUT_DIR": "D:/work/ai_images"}`를 추가하세요.
+키 파일은 키 한 줄만 있어도 되고, `OPENAI_API_KEY=sk-...` 형식이어도 됩니다. 서버 시작 시 어디서 키를 읽었는지 로그에 남습니다.
 
 5. Claude Desktop을 **트레이에서 완전히 종료** 후 다시 실행 → 도구 목록에 `openai-image-local` 확인
 
@@ -80,7 +81,8 @@ a1b2c3d4 에서 신발만 빨간색으로
 
 | 이름 | 기본값 | 설명 |
 |---|---|---|
-| `OPENAI_API_KEY` | (필수) | OpenAI API 키 |
+| `OPENAI_API_KEY` | | OpenAI API 키 (있으면 우선) |
+| `OPENAI_API_KEY_FILE` | | 키가 들어 있는 파일 경로 (`OPENAI_API_KEY`가 없을 때 사용) |
 | `OUTPUT_DIR` | `~/Pictures/openai_image_mcp` | 결과 저장 폴더 (`.index.jsonl`에 코드·프롬프트 기록) |
 | `OPENAI_IMAGE_MODEL` | `gpt-image-2` | 모델 |
 | `DEFAULT_QUALITY` | `medium` | low / medium / high / auto |

@@ -84,14 +84,43 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 _client = None
 
 
+def _api_key() -> tuple[str | None, str]:
+    """Key from OPENAI_API_KEY, else from the file named by OPENAI_API_KEY_FILE.
+
+    The file may hold just the key, a `OPENAI_API_KEY=sk-...` line, or anything else
+    containing an `sk-...` token (comments with # are ignored)."""
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if key:
+        return key, "OPENAI_API_KEY"
+    file = os.environ.get("OPENAI_API_KEY_FILE", "").strip().strip('"').strip("'")
+    if not file:
+        return None, "neither OPENAI_API_KEY nor OPENAI_API_KEY_FILE is set"
+    p = Path(os.path.expandvars(os.path.expanduser(file)))
+    if not p.is_file():
+        return None, f"OPENAI_API_KEY_FILE not found: {p}"
+    text = p.read_text(encoding="utf-8-sig", errors="ignore")
+    m = re.search(r"sk-[A-Za-z0-9_\-]{20,}", text)
+    if m:
+        return m.group(0), str(p)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if lines:
+        line = lines[0].split("=", 1)[-1].strip().strip('"').strip("'")
+        if line:
+            return line, str(p)
+    return None, f"no key found in {p}"
+
+
 def openai_client():
     global _client
     if _client is None:
         from openai import AsyncOpenAI
 
+        key, source = _api_key()
+        if not key:
+            raise RuntimeError(f"No OpenAI API key: {source}")
         # No automatic retries: a retried 4-minute timeout turns one slow image into a
         # 15-minute wait. Errors go back to Claude immediately instead.
-        _client = AsyncOpenAI(timeout=OPENAI_TIMEOUT, max_retries=0)
+        _client = AsyncOpenAI(api_key=key, timeout=OPENAI_TIMEOUT, max_retries=0)
     return _client
 
 
@@ -498,8 +527,13 @@ def open_output_folder() -> str:
 
 
 def main() -> None:
-    if BACKEND == "openai" and not os.environ.get("OPENAI_API_KEY"):
-        log.error("OPENAI_API_KEY is not set (put it in %s or the MCP config 'env').", HERE / ".env")
+    if BACKEND == "openai":
+        key, source = _api_key()
+        if key:
+            log.info("OpenAI key loaded from %s", source)
+        else:
+            log.error("No OpenAI API key (%s). Set OPENAI_API_KEY or OPENAI_API_KEY_FILE in %s "
+                      "or the MCP config 'env'.", source, HERE / ".env")
     log.info("openai_image_mcp_local: model=%s backend=%s output=%s", MODEL, BACKEND, OUTPUT_DIR)
     mcp.run("stdio")
 
