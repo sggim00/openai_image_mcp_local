@@ -30,6 +30,8 @@ echo  3) Or for Claude Code:
 echo     claude mcp add openai-image-local -s user -- "%CD%\.venv\Scripts\python.exe" "%CD%\server.py"
 echo.
 echo  Then fully quit and restart Claude Desktop.
+echo.
+echo  4) To use it from your phone while this PC is on: run setup_mobile.bat
 pause
 exit /b 0
 

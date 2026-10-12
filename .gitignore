@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 output/
+logs/
+.gdrive_token.json
+client_secret*.json
