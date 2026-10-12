@@ -15,23 +15,12 @@ echo [2/3] Installing packages...
 
 if not exist .env copy .env.example .env >nul
 
-echo [3/3] Done.
+echo [3/3] Registering in Claude Desktop and testing the server...
+.venv\Scripts\python.exe register_claude.py
 echo.
-echo  1) Put your OpenAI key in: %CD%\.env
-echo  2) Add this to %%APPDATA%%\Claude\claude_desktop_config.json  ("mcpServers" section):
-echo.
-set "P=%CD:\=\\%"
-echo     "openai-image-local": {
-echo       "command": "%P%\\.venv\\Scripts\\python.exe",
-echo       "args": ["%P%\\server.py"]
-echo     }
-echo.
-echo  3) Or for Claude Code:
-echo     claude mcp add openai-image-local -s user -- "%CD%\.venv\Scripts\python.exe" "%CD%\server.py"
-echo.
-echo  Then fully quit and restart Claude Desktop.
-echo.
-echo  4) To use it from your phone while this PC is on: run setup_mobile.bat
+echo  OpenAI key: %CD%\.env  (OPENAI_API_KEY_FILE or OPENAI_API_KEY)
+echo  Claude Code: claude mcp add openai-image-local -s user -- "%CD%\.venv\Scripts\python.exe" "%CD%\server.py"
+echo  Phone use while this PC is on: run setup_mobile.bat
 pause
 exit /b 0
 

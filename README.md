@@ -32,7 +32,10 @@ OpenAI 이미지 모델(기본 `gpt-image-2`)로 이미지를 만들고 고치�
 1. Python 3.10 이상 설치
 2. 이 폴더에서 `install.bat` 실행 → `.venv` 생성 + 패키지 설치 + `.env` 생성
 3. `.env`에 키 지정 — 직접 `OPENAI_API_KEY=sk-...` 또는 키 파일 경로 `OPENAI_API_KEY_FILE=D:/.../xxx.api_key` (필요하면 `OUTPUT_DIR`도)
-4. 스크립트가 출력한 블록을 `%APPDATA%\Claude\claude_desktop_config.json`에 추가:
+4. `install.bat`이 마지막에 `register_claude.py`를 실행해 Claude Desktop 설정에 자동 등록하고 서버가 뜨는지 확인합니다.
+   (Microsoft Store판 Claude는 설정 파일이 `%LOCALAPPDATA%\Packages\Claude_…\LocalCache\Roaming\Claude`에 있어
+   `%APPDATA%\Claude`를 고쳐도 반영되지 않습니다. 스크립트는 두 곳 모두 찾아 고칩니다.)
+   직접 넣으려면 Claude Desktop → 설정 → 개발자 → **구성 편집**으로 연 파일에:
 
 ```json
 {
