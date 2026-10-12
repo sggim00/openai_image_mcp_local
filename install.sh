@@ -7,7 +7,7 @@ DIR="$(pwd)"
 [ -d .venv ] || python3 -m venv .venv
 .venv/bin/python -m pip install -q --upgrade pip
 .venv/bin/python -m pip install -q -r requirements.txt
-[ -f .env ] || cp .env.example .env
+[ -f .env ] || [ ! -f .env.example ] || cp .env.example .env
 
 cat <<EOF
 

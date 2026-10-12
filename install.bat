@@ -13,7 +13,7 @@ echo [2/3] Installing packages...
 .venv\Scripts\python.exe -m pip install -q --upgrade pip
 .venv\Scripts\python.exe -m pip install -q -r requirements.txt || goto :fail
 
-if not exist .env copy .env.example .env >nul
+if not exist .env if exist .env.example copy .env.example .env >nul
 
 echo [3/3] Registering in Claude Desktop and testing the server...
 .venv\Scripts\python.exe register_claude.py
