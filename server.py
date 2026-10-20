@@ -1,4 +1,5 @@
-"""openai_image_mcp_local — OpenAI image generation as a LOCAL (stdio) MCP server.
+"""openai_image_mcp_local — image (OpenAI gpt-image / Google Gemini) and video (Gemini)
+generation as a LOCAL (stdio) MCP server.
 
 For Claude Desktop / Claude Code on your own machine. No hosting, no upload page:
 reference images are passed as local file paths, codes of earlier results, URLs or
@@ -9,7 +10,8 @@ Tools
 - generate_image  : prompt (+ optional reference images) -> image
 - generate_batch  : several prompts sharing the same references, rendered in parallel
 - edit_image      : change an existing image, keeping the rest
-- wait_for_images : collect results of jobs that took longer than one tool call
+- generate_video  : prompt (+ optional images) -> short video with sound (Gemini Omni)
+- wait_for_images : collect results of jobs (images or videos) that took longer than one tool call
 - list_recent     : recent results (code, path, prompt)
 - open_output_folder : open the output folder in Explorer / Finder
 
@@ -61,6 +63,8 @@ def _load_dotenv(path: Path) -> None:
 
 
 _load_dotenv(HERE / ".env")
+
+import gemini  # noqa: E402  (reads its settings from the environment loaded above)
 
 MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", "medium")
@@ -264,6 +268,8 @@ async def _resolve_one(ref: str) -> tuple[str, tuple[str, bytes, str]]:
         return str(p), _as_api_image(p.read_bytes(), p.name)
     m = _find_code(s)
     if m:
+        if m.get("media") == "video":
+            raise RefError(f"{ref} is a video, not an image (use it as continue_from in generate_video)")
         p = Path(m["path"])
         return m["id"][:8], _as_api_image(p.read_bytes(), p.name)
     raise RefError(f"not found: {ref}")
@@ -296,13 +302,77 @@ async def _load_refs(refs: list[str] | None) -> tuple[list[str], list[tuple[str,
 # --------------------------------------------------------------------------
 # Rendering jobs
 # --------------------------------------------------------------------------
+PROVIDERS = ("auto", "openai", "gemini", "gemini-pro")
+
+
+def openai_available() -> bool:
+    return _api_key()[0] is not None
+
+
+def pick_provider(requested: str | None, kind: str, n_refs: int, background: str) -> str:
+    """Resolve 'auto' to a concrete provider.
+
+    auto: new images -> OpenAI (strongest at composing a picture from a description),
+          edits of an existing image -> Gemini (strongest at changing only what was asked).
+    Overrides: transparent background -> OpenAI (Gemini cannot), more refs than OpenAI
+    takes -> Gemini. Falls back to whichever provider has an API key."""
+    req = (requested or "auto").lower()
+    if req not in PROVIDERS:
+        raise RefError(f"provider must be one of {', '.join(PROVIDERS)} (got {requested}).")
+    if req.startswith("gemini") and background == "transparent":
+        raise RefError("Gemini cannot make transparent backgrounds. Use provider 'openai' for cut-out assets.")
+    if BACKEND == "fake":
+        return "openai" if req == "auto" and kind != "edit" else ("gemini" if req == "auto" else req)
+    has_o, has_g = openai_available(), gemini.available()
+    if req == "auto":
+        if background == "transparent":
+            req = "openai"
+        elif kind == "edit":
+            req = "gemini"
+        else:
+            req = "openai"
+        if req == "openai" and not has_o and has_g:
+            req = "gemini"
+        elif req.startswith("gemini") and not has_g and has_o:
+            req = "openai"
+    if req == "openai" and not has_o:
+        raise RefError(f"No OpenAI API key ({_api_key()[1]}). Use provider 'gemini' or set the key.")
+    if req.startswith("gemini") and not has_g:
+        raise RefError(f"No Gemini API key ({gemini.api_key()[1]}). Set GEMINI_API_KEY_FILE in .env.")
+    if req.startswith("gemini") and background == "transparent":
+        raise RefError("Gemini cannot make transparent backgrounds. Use provider 'openai' for cut-out assets.")
+    return req
+
+
+def _convert(data: bytes, want: str) -> tuple[bytes, str]:
+    """Gemini returns PNG or JPEG; convert when another format was asked for."""
+    im = PILImage.open(io.BytesIO(data))
+    have = (im.format or "png").lower()
+    if have == want or want not in API_FORMATS:
+        return data, (have if have in API_FORMATS else "png")
+    if want == "jpeg" and im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, want.upper())
+    return buf.getvalue(), want
+
+
 async def _render(prompt: str, refs: list[tuple[str, bytes, str]], size: str, quality: str,
-                  background: str, output_format: str) -> tuple[bytes, str]:
+                  background: str, output_format: str, provider: str = "openai") -> tuple[bytes, str, str]:
+    """-> (image bytes, format, model used)"""
     if BACKEND == "fake":
         if FAKE_DELAY:
             await asyncio.sleep(FAKE_DELAY)
-        tag = f"[{len(refs)} ref] " if refs else ""
-        return _fake_image(tag + prompt, "1024x1024" if size == "auto" else size), "png"
+        tag = f"[{provider}] " + (f"[{len(refs)} ref] " if refs else "")
+        return _fake_image(tag + prompt, "1024x1024" if not re.match(r"^\d+x\d+$", size) else size), "png", "fake"
+    if provider.startswith("gemini"):
+        model = gemini.IMAGE_MODEL_PRO if provider == "gemini-pro" else gemini.IMAGE_MODEL
+        data, model = await gemini.render_image(prompt, refs, size, quality, output_format, model)
+        data, fmt = _convert(data, output_format)
+        return data, fmt, model
+    if ":" in size:  # an aspect ratio meant for Gemini
+        size = {"1:1": "1024x1024"}.get(size) or ("1536x1024" if int(size.split(":")[0]) > int(size.split(":")[1])
+                                                 else "1024x1536")
     kwargs: dict = dict(model=MODEL, prompt=prompt, size=size, quality=quality, output_format=output_format)
     if background != "auto":
         kwargs["background"] = background
@@ -312,25 +382,43 @@ async def _render(prompt: str, refs: list[tuple[str, bytes, str]], size: str, qu
         r = await openai_client().images.edit(image=refs if len(refs) > 1 else refs[0], **kwargs)
     else:
         r = await openai_client().images.generate(**kwargs)
-    return base64.b64decode(r.data[0].b64_json), output_format
+    return base64.b64decode(r.data[0].b64_json), output_format, MODEL
+
+
+async def _render_video(prompt: str, images: list[tuple[str, bytes, str]], aspect_ratio: str, resolution: str,
+                        previous: str | None, task: str | None) -> tuple[bytes, str]:
+    """-> (mp4 bytes, interaction id)"""
+    if BACKEND == "fake":
+        await asyncio.sleep(FAKE_DELAY)
+        return b"FAKE MP4 " + prompt[:200].encode(), "fake_" + uuid.uuid4().hex[:8]
+    return await gemini.render_video(prompt, images, aspect_ratio, resolution, previous, task)
 
 
 JOBS: dict[str, dict] = {}
 
 
 def _start_job(kind: str, prompt: str, ref_labels: list[str], refs: list[tuple[str, bytes, str]],
-               size: str, quality: str, background: str, output_format: str, filename: str | None) -> str:
+               size: str, quality: str, background: str, output_format: str, filename: str | None,
+               provider: str = "openai") -> str:
+    async def render() -> tuple[bytes, str, dict]:
+        data, fmt, model = await _render(prompt, refs, size, quality, background, output_format, provider)
+        return data, fmt, {"model": model, "provider": provider, "size": size, "quality": quality}
+
+    return _start(kind, prompt, ref_labels, filename, render)
+
+
+def _start(kind: str, prompt: str, ref_labels: list[str], filename: str | None, render) -> str:
     job_id = "job_" + uuid.uuid4().hex[:10]
 
     async def run() -> dict:
         t0 = time.time()
         try:
-            data, fmt = await _render(prompt, refs, size, quality, background, output_format)
+            data, fmt, extra = await render()
         except Exception as e:  # surfaced to Claude as text, never raised through MCP
             log.warning("%s failed after %.1fs: %s", job_id, time.time() - t0, e)
             return {"error": f"{type(e).__name__}: {e}", "seconds": time.time() - t0}
-        meta = {"kind": kind, "prompt": prompt, "model": MODEL, "size": size, "quality": quality,
-                "references": ref_labels, "seconds": round(time.time() - t0, 1)}
+        meta = {"kind": kind, "prompt": prompt, "references": ref_labels, **extra,
+                "seconds": round(time.time() - t0, 1)}
         meta = _save(data, fmt, meta, filename)
         log.info("%s done in %.1fs -> %s", job_id, time.time() - t0, meta["path"])
         return {"meta": meta, "data": data}
@@ -349,6 +437,7 @@ async def _collect(job_ids: list[str], wait: float) -> list:
 
     preview_px = PREVIEW_MAX if len(job_ids) == 1 else 512
     texts, images, still = [], [], []
+    done_video = False
     for j in job_ids:
         if j not in tasks:
             texts.append(f"- {j}: unknown job (the server was restarted). Generate it again.")
@@ -363,19 +452,29 @@ async def _collect(job_ids: list[str], wait: float) -> list:
             texts.append(f"- {j}: FAILED after {res['seconds']:.0f}s — {res['error']}")
             continue
         m = res["meta"]
-        texts.append(f"- {j}: done in {m['seconds']}s | code `{m['id'][:8]}` | saved: {m['path']}")
+        via = f" | {m.get('model')}" if m.get("model") else ""
+        if m.get("media") == "video":
+            texts.append(f"- {j}: VIDEO done in {m['seconds']}s{via} | code `{m['id'][:8]}` | saved: {m['path']}")
+            done_video = True
+            continue
+        texts.append(f"- {j}: done in {m['seconds']}s{via} | code `{m['id'][:8]}` | saved: {m['path']}")
         images.append(Image(data=_preview(res["data"], preview_px), format="jpeg"))
 
     header = []
     if still:
         header.append(
-            f"{len(still)} image(s) still rendering. Tell the user briefly, then call wait_for_images "
+            f"{len(still)} job(s) still rendering. Tell the user briefly, then call wait_for_images "
             f"with job_ids {json.dumps(still)} (do not start them again)."
         )
     if images:
         header.append(
             "Tell the user where each file was saved. The short code (or the file path) can be used in "
             "reference_images / image in later calls."
+        )
+    if done_video:
+        header.append(
+            "Videos cannot be previewed here: give the user the saved .mp4 path. To change or lengthen a "
+            "video, call generate_video with continue_from=<its code>."
         )
     return ["\n".join(header + texts)] + images
 
@@ -384,7 +483,23 @@ async def _collect(job_ids: list[str], wait: float) -> list:
 # MCP server
 # --------------------------------------------------------------------------
 INSTRUCTIONS = f"""\
-Local server that creates and edits images with OpenAI's {MODEL}. Results are saved to {OUTPUT_DIR}.
+Local server that creates and edits images (OpenAI {MODEL} or Google Gemini) and short videos
+(Google {gemini.VIDEO_MODEL}). Results are saved to {OUTPUT_DIR}.
+
+Choosing the image model (provider) — decide per request, it is your call
+- "openai" ({MODEL}): best at NEW pictures from a description — composition, illustration and
+  character design, faithful long prompts, clean layouts, transparent backgrounds (cut-out assets).
+- "gemini" ({gemini.IMAGE_MODEL}): best at EDITING — change only what was asked and keep everything
+  else (face, pose, lighting, style) identical; multi-turn tweaks; combining several reference
+  images (up to 14) while keeping one character consistent; fast.
+- "gemini-pro" ({gemini.IMAGE_MODEL_PRO}): Gemini's premium model — hardest edits, precise text in
+  the image, brand / product consistency, up to 4K. Slower and more expensive.
+- "auto" (default): generate_image / generate_batch -> openai, edit_image -> gemini, transparent
+  background -> openai, and whichever has an API key if one is missing.
+- Rules of thumb: "make / draw / design" -> openai. "change / fix / remove / add / recolor / keep the rest",
+  turning a photo into another pose or outfit while keeping the person, or splitting an existing
+  character into parts that must match it exactly -> gemini. If one provider's result misses, offer
+  to retry with the other.
 
 Reference images (IMPORTANT)
 - This server runs on the user's computer, so it can read their files directly. When the user wants
@@ -401,14 +516,24 @@ Prompts
   proportions. Show ..."
 - Keep any text that must appear in the image exactly as the user wrote it.
 
+Video (generate_video, Gemini only)
+- Text -> video, image -> video (one image = first frame, two = first and last frame, or up to 3 as
+  subject references), with generated sound. Describe camera, motion, mood and audio (or "no dialogue")
+  in the prompt; there is no negative prompt, so state what to avoid in the prompt.
+- To change or lengthen a finished video, call generate_video again with continue_from=<its code> and
+  only the change ("make it night", "extend: the camera pulls back").
+- A video takes about 1-5 minutes: the first call usually returns a job id; keep calling
+  wait_for_images with it. Videos are not previewed; give the user the .mp4 path.
+
 Tools
 - One image: generate_image. Several related images: ONE generate_batch call (renders in parallel).
 - Changing an existing result: edit_image with its code or path.
 - Rendering takes about 30-120s per image. If a call returns job ids that are still rendering, call
   wait_for_images with those ids; never re-submit the same prompt.
-- Default quality is "{DEFAULT_QUALITY}". Use "low" for quick drafts, "high" only for finals.
-- Afterwards reply briefly in the user's language with the saved file paths, and point out anything
-  that clearly missed the request.
+- Default quality is "{DEFAULT_QUALITY}". Use "low" for quick drafts, "high" only for finals
+  (for Gemini, "high" means 2K output and more thinking).
+- Afterwards reply briefly in the user's language with the saved file paths and which model made
+  them, and point out anything that clearly missed the request.
 """
 
 mcp = MCPServer(name="openai-image-local", instructions=INSTRUCTIONS)
@@ -416,10 +541,15 @@ mcp = MCPServer(name="openai-image-local", instructions=INSTRUCTIONS)
 Quality = Literal["low", "medium", "high", "auto"]
 OutFmt = Literal["png", "jpeg", "webp"]
 Bg = Literal["auto", "opaque", "transparent"]
-SizeDesc = "'1024x1024' (square), '1536x1024' (landscape), '1024x1536' (portrait) or 'auto'."
+Provider = Literal["auto", "openai", "gemini", "gemini-pro"]
+SizeDesc = ("'1024x1024' (square), '1536x1024' (landscape), '1024x1536' (portrait) or 'auto'. Gemini also "
+            "takes an aspect ratio such as '16:9', '9:16', '4:5', '21:9'.")
 RefDesc = ("Reference images the model should see and follow (style / character / product). Each item is an "
            "absolute file path, the code of an earlier result, an http(s) URL, or 'clipboard'.")
 NameDesc = "Optional file name (no extension) for the saved image. Default: date + prompt."
+ProviderDesc = ("Which model makes the image: 'openai' (new pictures, composition, transparent bg), 'gemini' "
+                "(precise edits that keep the rest, multi-reference consistency), 'gemini-pro' (hardest edits, "
+                "text in image, up to 4K), or 'auto'. Choose deliberately; see the server instructions.")
 
 
 @mcp.tool()
@@ -428,17 +558,19 @@ async def generate_image(
     reference_images: Annotated[list[str] | None, Field(description=RefDesc)] = None,
     size: Annotated[str, Field(description=SizeDesc)] = "1024x1024",
     quality: Annotated[Quality | None, Field(description="low / medium / high / auto. Omit for the default.")] = None,
-    background: Annotated[Bg, Field(description="'transparent' for cut-out assets.")] = "auto",
+    background: Annotated[Bg, Field(description="'transparent' for cut-out assets (OpenAI only).")] = "auto",
     output_format: Annotated[OutFmt, Field(description="File format of the saved image.")] = "png",
     filename: Annotated[str | None, Field(description=NameDesc)] = None,
+    provider: Annotated[Provider, Field(description=ProviderDesc)] = "auto",
 ) -> list:
     """Create one image, optionally guided by reference images. Saves it locally and returns a preview, or a job id if still rendering."""
     try:
         labels, refs = await _load_refs(reference_images)
+        prov = pick_provider(provider, "generate", len(refs), background)
     except RefError as e:
         return [str(e)]
     job = _start_job("generate", prompt, labels, refs, size, quality or DEFAULT_QUALITY, background,
-                     output_format, filename)
+                     output_format, filename, prov)
     return await _collect([job], WAIT_SECONDS)
 
 
@@ -448,18 +580,20 @@ async def generate_batch(
     reference_images: Annotated[list[str] | None, Field(description=RefDesc + " Shared by every prompt.")] = None,
     size: Annotated[str, Field(description=SizeDesc)] = "1024x1024",
     quality: Annotated[Quality | None, Field(description="low / medium / high / auto. Omit for the default.")] = None,
-    background: Annotated[Bg, Field(description="'transparent' for cut-out assets.")] = "auto",
+    background: Annotated[Bg, Field(description="'transparent' for cut-out assets (OpenAI only).")] = "auto",
     output_format: Annotated[OutFmt, Field(description="File format of the saved images.")] = "png",
+    provider: Annotated[Provider, Field(description=ProviderDesc)] = "auto",
 ) -> list:
     """Create several related images in parallel (e.g. every part of one character, or style variations)."""
     if not 1 <= len(prompts) <= MAX_BATCH:
         return [f"Give between 1 and {MAX_BATCH} prompts."]
     try:
         labels, refs = await _load_refs(reference_images)
+        prov = pick_provider(provider, "generate", len(refs), background)
     except RefError as e:
         return [str(e)]
     q = quality or DEFAULT_QUALITY
-    jobs = [_start_job("generate", p, labels, refs, size, q, background, output_format, None) for p in prompts]
+    jobs = [_start_job("generate", p, labels, refs, size, q, background, output_format, None, prov) for p in prompts]
     return await _collect(jobs, WAIT_SECONDS)
 
 
@@ -470,17 +604,61 @@ async def edit_image(
     reference_images: Annotated[list[str] | None, Field(description="Extra reference images (same formats).")] = None,
     size: Annotated[str, Field(description=SizeDesc)] = "auto",
     quality: Annotated[Quality | None, Field(description="low / medium / high / auto. Omit for the default.")] = None,
-    background: Annotated[Bg, Field(description="'transparent' for cut-out assets.")] = "auto",
+    background: Annotated[Bg, Field(description="'transparent' for cut-out assets (OpenAI only).")] = "auto",
     output_format: Annotated[OutFmt, Field(description="File format of the saved image.")] = "png",
     filename: Annotated[str | None, Field(description=NameDesc)] = None,
+    provider: Annotated[Provider, Field(description=ProviderDesc + " 'auto' uses Gemini for edits.")] = "auto",
 ) -> list:
     """Change an existing image while keeping the rest of it. Saves the result locally and returns a preview."""
     try:
         labels, refs = await _load_refs([image] + list(reference_images or []))
+        prov = pick_provider(provider, "edit", len(refs), background)
     except RefError as e:
         return [str(e)]
     job = _start_job("edit", instruction, labels, refs, size, quality or DEFAULT_QUALITY, background,
-                     output_format, filename)
+                     output_format, filename, prov)
+    return await _collect([job], WAIT_SECONDS)
+
+
+@mcp.tool()
+async def generate_video(
+    prompt: Annotated[str, Field(description="Detailed English description: subject, action, camera, style, sound. "
+                                             "With continue_from: only the change or what happens next.")],
+    images: Annotated[list[str] | None, Field(description="0-3 images (same formats as reference_images). One = first "
+                                                         "frame; two = first and last frame; or subject references "
+                                                         "(say which in the prompt).")] = None,
+    aspect_ratio: Annotated[Literal["16:9", "9:16"], Field(description="16:9 landscape or 9:16 vertical.")] = "16:9",
+    resolution: Annotated[Literal["360p", "720p", "1080p", "4k"], Field(description="720p default; 1080p/4k are "
+                                                                                    "upscaled and slower.")] = "720p",
+    continue_from: Annotated[str | None, Field(description="Code of an earlier video from this server, to edit or "
+                                                           "extend it (multi-turn).")] = None,
+    task: Annotated[Literal["text_to_video", "image_to_video", "reference_to_video", "edit", "extend"] | None,
+                    Field(description="Optional; normally leave empty and let the prompt decide.")] = None,
+    filename: Annotated[str | None, Field(description="Optional file name (no extension) for the .mp4.")] = None,
+) -> list:
+    """Make a short video with sound using Google Gemini Omni (text and/or images in, .mp4 out), or edit/extend an earlier one."""
+    if BACKEND != "fake" and not gemini.available():
+        return [f"No Gemini API key ({gemini.api_key()[1]}). Set GEMINI_API_KEY_FILE in {HERE / '.env'}."]
+    previous = None
+    if continue_from:
+        m = _find_code(continue_from)
+        if not m or m.get("media") != "video" or not m.get("interaction_id"):
+            return [f"{continue_from} is not the code of a video made by this server (see list_recent)."]
+        previous = m["interaction_id"]
+    try:
+        labels, refs = await _load_refs(images)
+    except RefError as e:
+        return [str(e)]
+    if len(refs) > gemini.VIDEO_MAX_IMAGES:
+        return [f"Give at most {gemini.VIDEO_MAX_IMAGES} images for a video."]
+
+    async def render() -> tuple[bytes, str, dict]:
+        data, interaction = await _render_video(prompt, refs, aspect_ratio, resolution, previous, task)
+        return data, "mp4", {"media": "video", "model": gemini.VIDEO_MODEL if BACKEND != "fake" else "fake",
+                             "provider": "gemini", "aspect_ratio": aspect_ratio, "resolution": resolution,
+                             "interaction_id": interaction, "continued_from": continue_from}
+
+    job = _start("video", prompt, labels, filename, render)
     return await _collect([job], WAIT_SECONDS)
 
 
@@ -488,7 +666,7 @@ async def edit_image(
 async def wait_for_images(
     job_ids: Annotated[list[str], Field(description="Job ids returned as still rendering.")],
 ) -> list:
-    """Wait for images that were still rendering and return them."""
+    """Wait for images or videos that were still rendering and return them."""
     return await _collect(job_ids, WAIT_SECONDS)
 
 
@@ -499,6 +677,8 @@ def list_recent(limit: Annotated[int, Field(ge=1, le=50)] = 10) -> str:
         {
             "code": m["id"][:8],
             "kind": m.get("kind"),
+            "media": m.get("media", "image"),
+            "model": m.get("model"),
             "path": m["path"],
             "prompt": (m.get("prompt") or "")[:200],
             "created": datetime.fromtimestamp(m.get("created", 0)).strftime("%Y-%m-%d %H:%M"),
@@ -529,12 +709,14 @@ def open_output_folder() -> str:
 def main() -> None:
     if BACKEND == "openai":
         key, source = _api_key()
-        if key:
-            log.info("OpenAI key loaded from %s", source)
-        else:
-            log.error("No OpenAI API key (%s). Set OPENAI_API_KEY or OPENAI_API_KEY_FILE in %s "
-                      "or the MCP config 'env'.", source, HERE / ".env")
-    log.info("openai_image_mcp_local: model=%s backend=%s output=%s", MODEL, BACKEND, OUTPUT_DIR)
+        gkey, gsource = gemini.api_key()
+        log.info("OpenAI key: %s", source if key else "MISSING (" + source + ")")
+        log.info("Gemini key: %s", gsource if gkey else "MISSING (" + gsource + ")")
+        if not key and not gkey:
+            log.error("No API key at all. Set OPENAI_API_KEY_FILE and/or GEMINI_API_KEY_FILE in %s "
+                      "or the MCP config 'env'.", HERE / ".env")
+    log.info("openai_image_mcp_local: openai=%s gemini=%s/%s video=%s backend=%s output=%s", MODEL,
+             gemini.IMAGE_MODEL, gemini.IMAGE_MODEL_PRO, gemini.VIDEO_MODEL, BACKEND, OUTPUT_DIR)
     mcp.run("stdio")
 
 

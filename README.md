@@ -1,6 +1,8 @@
 # openai_image_mcp_local
 
-OpenAI 이미지 모델(기본 `gpt-image-2`)로 이미지를 만들고 고치는 **내 PC용** 도구입니다.
+OpenAI(`gpt-image-2`)와 Google Gemini(Nano Banana)로 이미지를 만들고 고치고,
+Gemini Omni로 짧은 영상(소리 포함)을 만드는 **내 PC용** 도구입니다.
+Claude가 요청마다 더 잘 나올 모델을 고릅니다 (`provider`).
 
 - **PC에서** — Claude 데스크톱 앱 / Claude Code가 `server.py`를 직접 실행하는 로컬 MCP 서버(stdio).
 - **휴대폰에서** — PC가 켜져 있으면 `drive_worker.py`가 구글 드라이브를 우편함으로 써서 대신 처리합니다.
@@ -31,7 +33,8 @@ OpenAI 이미지 모델(기본 `gpt-image-2`)로 이미지를 만들고 고치�
 
 1. Python 3.10 이상 설치
 2. 이 폴더에서 `install.bat` 실행 → `.venv` 생성 + 패키지 설치 + `.env` 생성
-3. `.env`에 키 지정 — 직접 `OPENAI_API_KEY=sk-...` 또는 키 파일 경로 `OPENAI_API_KEY_FILE=D:/.../xxx.api_key` (필요하면 `OUTPUT_DIR`도)
+3. `.env`에 키 지정 — 직접 `OPENAI_API_KEY=sk-...` 또는 키 파일 경로 `OPENAI_API_KEY_FILE=D:/.../xxx.api_key` (필요하면 `OUTPUT_DIR`도).
+   Gemini도 쓰려면 `GEMINI_API_KEY_FILE=D:/.../gemini.api_key` (또는 `GEMINI_API_KEY=AIza...`). 둘 중 하나만 있어도 동작합니다.
 4. `install.bat`이 마지막에 `register_claude.py`를 실행해 Claude Desktop 설정에 자동 등록하고 서버가 뜨는지 확인합니다.
    (Microsoft Store판 Claude는 설정 파일이 `%LOCALAPPDATA%\Packages\Claude_…\LocalCache\Roaming\Claude`에 있어
    `%APPDATA%\Claude`를 고쳐도 반영되지 않습니다. 스크립트는 두 곳 모두 찾아 고칩니다.)
@@ -66,9 +69,32 @@ claude mcp add openai-image-local -s user -- "<폴더>/.venv/Scripts/python.exe"
 | `generate_image` | 1장 생성. `reference_images`로 스타일·캐릭터 유지, `filename`으로 저장 이름 지정 |
 | `generate_batch` | 같은 레퍼런스로 최대 8장 **병렬** 생성 (파츠 분리, 시안 여러 개) |
 | `edit_image` | 기존 이미지(경로·코드·클립보드)를 지시대로 수정 |
-| `wait_for_images` | 50초 안에 안 끝난 작업을 이어서 받아옴 |
+| `generate_video` | 텍스트/이미지 → 짧은 영상 (.mp4, 소리 포함). `continue_from`으로 이전 영상 수정·연장 |
+| `wait_for_images` | 50초 안에 안 끝난 작업(이미지·영상)을 이어서 받아옴 |
 | `list_recent` | 최근 결과 (코드, 경로, 프롬프트) |
 | `open_output_folder` | 결과 폴더를 탐색기/Finder로 열기 |
+
+## 모델 선택 (`provider`)
+
+이미지 도구 3개에 `provider`가 있습니다. Claude가 요청을 보고 고르고, 직접 지정해도 됩니다.
+
+| 값 | 모델 | 잘하는 것 |
+|---|---|---|
+| `openai` | `gpt-image-2` | **새 그림** — 설명으로 구도 잡기, 일러스트·캐릭터 디자인, 긴 프롬프트, 투명 배경 |
+| `gemini` | `gemini-nano-banana-2.1` | **수정** — 요청한 부분만 바꾸고 나머지(얼굴·포즈·조명·스타일) 유지, 여러 레퍼런스(최대 14장)로 캐릭터 일관성, 빠름 |
+| `gemini-pro` | `gemini-3-pro-image` | 어려운 수정, 이미지 속 글자, 최대 4K. 느리고 비쌈 |
+| `auto` (기본) | | `generate_*` → openai, `edit_image` → gemini, 투명 배경 → openai, 키가 하나뿐이면 그쪽 |
+
+Gemini는 투명 배경을 만들지 못합니다. `size`에는 `1024x1024` 같은 값 외에 Gemini용 비율(`16:9`, `4:5`, `21:9` 등)도 넣을 수 있고,
+`quality: high`는 Gemini에서 2K 출력 + 깊은 추론입니다.
+
+## 영상 (`generate_video`, Gemini Omni Flash)
+
+- 텍스트만 → 영상, 이미지 1장 → 첫 프레임, 2장 → 첫/마지막 프레임, 최대 3장을 인물·물건 레퍼런스로.
+- `aspect_ratio` 16:9 / 9:16, `resolution` 360p / 720p(기본) / 1080p / 4k(업스케일).
+- 끝난 영상의 코드를 `continue_from`에 넣고 "밤으로 바꿔", "이어서 카메라가 뒤로 빠짐"처럼 바꿀 점만 쓰면 수정·연장됩니다.
+- 1~5분 걸립니다. 결과는 `OUTPUT_DIR`에 `.mp4`로 저장되고 대화창 미리보기는 없습니다.
+- 네거티브 프롬프트가 없으니 피할 것은 프롬프트에 적습니다 ("no dialogue", "no text on screen").
 
 ## 레퍼런스 이미지 넘기는 법
 
@@ -122,10 +148,21 @@ a1b2c3d4 에서 신발만 빨간색으로
 
 ```json
 {"prompt": "detailed English prompt", "references": ["latest"], "size": "1024x1536",
- "quality": "medium", "background": "auto", "output_format": "png"}
+ "quality": "medium", "background": "auto", "output_format": "png",
+ "provider": "auto", "edit": false}
 ```
 
-결과 `outputs/<id>.result.json`: `{"status": "done", "code", "image": {"id","name","url"}, "local_path", "seconds", ...}`
+`provider`: `auto` / `openai` / `gemini` / `gemini-pro`. 기존 그림 수정이면 `"edit": true` (auto일 때 Gemini 사용).
+
+영상 요청:
+
+```json
+{"type": "video", "prompt": "...", "references": ["latest"], "aspect_ratio": "9:16",
+ "resolution": "720p", "continue_from": "<이전 영상 코드, 선택>"}
+```
+
+결과 `outputs/<id>.result.json`: 이미지는 `{"status": "done", "media": "image", "code", "provider", "model", "image": {"id","name","url"}, "local_path", "seconds", ...}`,
+영상은 `"media": "video"`에 `"video": {"id","name","url"}` (`outputs/<id>.mp4`)
 또는 `{"status": "error", "error": "..."}`. 드라이브 `openai_image_mcp/worker_status.json`의 `last_seen`이 몇 분 이상 지났으면
 PC가 꺼졌거나 잠들었거나 워커가 멈춘 것입니다.
 
@@ -150,6 +187,12 @@ PC가 꺼졌거나 잠들었거나 워커가 멈춘 것입니다.
 | `OPENAI_API_KEY_FILE` | | 키가 들어 있는 파일 경로 (`OPENAI_API_KEY`가 없을 때 사용) |
 | `OUTPUT_DIR` | `~/Pictures/openai_image_mcp` | 결과 저장 폴더 (`.index.jsonl`에 코드·프롬프트 기록) |
 | `OPENAI_IMAGE_MODEL` | `gpt-image-2` | 모델 |
+| `GEMINI_API_KEY` | | Gemini API 키 (있으면 우선) |
+| `GEMINI_API_KEY_FILE` | | Gemini 키 파일 경로 |
+| `GEMINI_IMAGE_MODEL` | `gemini-nano-banana-2.1` | `provider: gemini` 모델 |
+| `GEMINI_IMAGE_MODEL_PRO` | `gemini-3-pro-image` | `provider: gemini-pro` 모델 |
+| `GEMINI_VIDEO_MODEL` | `gemini-omni-1.1-flash` | 영상 모델 |
+| `GEMINI_TIMEOUT` / `GEMINI_VIDEO_TIMEOUT` | `240` / `900` | Gemini 요청 1건 최대 대기(초) |
 | `DEFAULT_QUALITY` | `medium` | low / medium / high / auto |
 | `OPENAI_TIMEOUT` | `240` | OpenAI 요청 1건 최대 대기(초), 재시도 없음 |
 | `TOOL_WAIT_SECONDS` | `50` | 도구 호출 1번이 기다리는 시간 |
