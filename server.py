@@ -68,7 +68,7 @@ _load_dotenv(HERE / ".env")
 import gemini  # noqa: E402  (reads its settings from the environment loaded above)
 import seedance  # noqa: E402
 
-VERSION = "2026.10.24-seedance2"
+VERSION = "2026.10.25-seedance3"
 MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", "medium")
 BACKEND = os.environ.get("IMAGE_BACKEND", "openai")  # "openai" | "fake" (testing, no API calls)
@@ -657,25 +657,31 @@ async def render_video(spec: VideoSpec, request: str | None = None) -> tuple[byt
             r = await seedance.render_video(spec["prompt"], spec["files"], urls, ratio=spec["aspect_ratio"],
                                             resolution=spec["resolution"], duration=spec["duration"],
                                             generate_audio=spec["generate_audio"], image_mode=spec["image_mode"],
-                                            fast=prov == "seedance-fast")
+                                            fast=prov == "seedance-fast",
+                                            on_task=lambda t: log.info("seedance task %s started", t))
         finally:
             await asyncio.to_thread(cleanup)
     meta = {**common, "model": r["model"], "task_id": r["task_id"], "video_url": r["video_url"],
             "duration": r["duration"], "aspect_ratio": r["ratio"], "resolution": r["resolution"], "seed": r["seed"],
             "generate_audio": spec["generate_audio"], "image_mode": spec["image_mode"],
             "reference_videos": [v if isinstance(v, str) else v.get("label") for v in spec["videos"]]}
+    _save_last_frame(r, meta, spec["prompt"], prov, request)
+    return r["video"], meta
+
+
+def _save_last_frame(r: dict, meta: dict, prompt: str, prov: str, request: str | None) -> None:
     if r.get("last_frame"):
         try:
             im = PILImage.open(io.BytesIO(r["last_frame"]))
             fmt = "jpeg" if (im.format or "").lower() == "jpeg" else "png"
-            lf = _save(r["last_frame"], fmt, {"kind": "last_frame", "prompt": "last frame of: " + spec["prompt"],
+            lf = _save(r["last_frame"], fmt, {"kind": "last_frame", "prompt": "last frame of: " + prompt,
                                               "model": r["model"], "provider": prov, "task_id": r["task_id"]},
                        (request + "_last") if request else None)
             meta["last_frame_code"] = lf["id"][:8]
             meta["last_frame_path"] = lf["path"]
         except Exception as e:  # the video itself is what matters
             log.warning("could not save the last frame of %s: %s", r["task_id"], e)
-    return r["video"], meta
+
 
 
 JOBS: dict[str, dict] = {}
@@ -816,7 +822,9 @@ Video (generate_video) — choose the provider per request
   mechanical design, proportions, joint layout and timing; only change materials, lighting and
   environment to ...". Local files go to Seedance through a temporary public Drive link that is removed
   afterwards; tell the user that once.
-- check_setup tests the keys and the Seedance connection without spending credit. Returns the last frame as an image code too —
+- check_setup tests the keys and the Seedance connection without spending credit.
+- If a Seedance video FAILED with a network / timeout error, the task usually still finishes on
+  BytePlus: call recover_video (no task id = newest unsaved task) instead of generating again. Returns the last frame as an image code too —
   use it as the first image of the next shot for continuity.
 - "seedance-fast" ({seedance.MODEL_FAST}): cheaper / quicker Seedance for drafts and tests.
 - "gemini" ({gemini.VIDEO_MODEL}): multi-turn editing and extension of its own videos through
@@ -1015,6 +1023,50 @@ def list_recent(limit: Annotated[int, Field(ge=1, le=50)] = 10) -> str:
     if not items:
         return f"No images yet. Output folder: {OUTPUT_DIR}"
     return json.dumps(items, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def recover_video(
+    task_id: Annotated[str | None, Field(description="Seedance task id (cgt-...). Omit to fetch the newest finished "
+                                                     "Seedance task that is not saved here yet.")] = None,
+    filename: Annotated[str | None, Field(description="Optional file name (no extension) for the .mp4.")] = None,
+) -> list:
+    """Fetch a Seedance video whose wait was interrupted (network error, timeout, server restart) without paying again."""
+    if BACKEND == "fake":
+        return ["fake backend"]
+    saved = {m.get("task_id") for m in _index_all() if m.get("task_id")}
+    try:
+        if task_id:
+            data = await seedance.get_task(task_id)
+        else:
+            items = await seedance.list_tasks(page_size=20)
+            items = [t for t in items if t.get("id") not in saved]
+            if not items:
+                return ["No unsaved Seedance task found (every recent task is already saved here)."]
+            items.sort(key=lambda t: t.get("created_at") or 0, reverse=True)
+            data = items[0]
+            task_id = data["id"]
+        status = str(data.get("status", "")).lower()
+        if task_id in saved:
+            m = next(m for m in _index_all() if m.get("task_id") == task_id)
+            return [f"{task_id} is already saved: code `{m['id'][:8]}` | {m['path']}"]
+        if status in ("queued", "running"):
+            return [f"{task_id} is still {status}. Call recover_video again in a minute (do not start a new video)."]
+        if status != "succeeded":
+            err = data.get("error") or {}
+            return [f"{task_id} ended as {status}: {err.get('code', '')} {err.get('message', '')}".strip()]
+        r = await seedance.collect(task_id, data)
+    except (seedance.SeedanceError, Exception) as e:
+        return [f"Could not recover: {type(e).__name__}: {e}"]
+    prov = "seedance-fast" if r["model"] == seedance.MODEL_FAST else "seedance"
+    meta = {"media": "video", "provider": prov, "model": r["model"], "task_id": task_id, "video_url": r["video_url"],
+            "duration": r["duration"], "aspect_ratio": r["ratio"], "resolution": r["resolution"], "seed": r["seed"],
+            "recovered": True}
+    prompt = f"(recovered Seedance task {task_id})"
+    _save_last_frame(r, meta, prompt, prov, filename)
+    m = _save(r["video"], "mp4", {"kind": "video", "prompt": prompt, **meta}, filename)
+    extra = f" | last frame image `{meta['last_frame_code']}`" if meta.get("last_frame_code") else ""
+    return [f"Recovered {task_id} ({r['model']}, {r['duration']}s){extra} | code `{m['id'][:8]}` | saved: {m['path']}"]
 
 
 @mcp.tool()

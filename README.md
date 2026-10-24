@@ -76,6 +76,7 @@ claude mcp add openai-image-local -s user -- "<폴더>/.venv/Scripts/python.exe"
 | `list_recent` | 최근 결과 (코드, 경로, 프롬프트) |
 | `open_output_folder` | 결과 폴더를 탐색기/Finder로 열기 |
 | `check_setup` | 키·Seedance 연결(크레딧 안 씀)·드라이브 연결·서버 버전 확인 |
+| `recover_video` | 네트워크 오류 등으로 대기가 끊긴 Seedance 영상을 다시 돈 내지 않고 받아오기 |
 
 ## 모델 선택 (`provider`)
 
