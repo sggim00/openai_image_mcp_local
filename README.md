@@ -1,7 +1,7 @@
 # openai_image_mcp_local
 
 OpenAI(`gpt-image-2`)와 Google Gemini(Nano Banana)로 이미지를 만들고 고치고,
-Gemini Omni로 짧은 영상(소리 포함)을 만드는 **내 PC용** 도구입니다.
+ByteDance **Seedance 2.5**(BytePlus ModelArk) 또는 Gemini Omni로 짧은 영상(소리 포함)을 만드는 **내 PC용** 도구입니다.
 Claude가 요청마다 더 잘 나올 모델을 고릅니다 (`provider`).
 
 - **PC에서** — Claude 데스크톱 앱 / Claude Code가 `server.py`를 직접 실행하는 로컬 MCP 서버(stdio).
@@ -35,6 +35,8 @@ Claude가 요청마다 더 잘 나올 모델을 고릅니다 (`provider`).
 2. 이 폴더에서 `install.bat` 실행 → `.venv` 생성 + 패키지 설치 + `.env` 생성
 3. `.env`에 키 지정 — 직접 `OPENAI_API_KEY=sk-...` 또는 키 파일 경로 `OPENAI_API_KEY_FILE=D:/.../xxx.api_key` (필요하면 `OUTPUT_DIR`도).
    Gemini도 쓰려면 `GEMINI_API_KEY_FILE=D:/.../gemini.api_key` (또는 `GEMINI_API_KEY=AIza...`). 둘 중 하나만 있어도 동작합니다.
+   Seedance 영상은 `SEEDANCE_API_KEY_FILE=D:/.../byteplus/xxx.api_key` (또는 `SEEDANCE_API_KEY=...`, BytePlus ModelArk API 키).
+   지정하지 않아도 OpenAI/Gemini 키 폴더 옆의 `byteplus/` 폴더(예: `.../data/byteplus/`)에 있는 키 파일을 자동으로 찾습니다.
 4. `install.bat`이 마지막에 `register_claude.py`를 실행해 Claude Desktop 설정에 자동 등록하고 서버가 뜨는지 확인합니다.
    (Microsoft Store판 Claude는 설정 파일이 `%LOCALAPPDATA%\Packages\Claude_…\LocalCache\Roaming\Claude`에 있어
    `%APPDATA%\Claude`를 고쳐도 반영되지 않습니다. 스크립트는 두 곳 모두 찾아 고칩니다.)
@@ -69,7 +71,7 @@ claude mcp add openai-image-local -s user -- "<폴더>/.venv/Scripts/python.exe"
 | `generate_image` | 1장 생성. `reference_images`로 스타일·캐릭터 유지, `filename`으로 저장 이름 지정 |
 | `generate_batch` | 같은 레퍼런스로 최대 8장 **병렬** 생성 (파츠 분리, 시안 여러 개) |
 | `edit_image` | 기존 이미지(경로·코드·클립보드)를 지시대로 수정 |
-| `generate_video` | 텍스트/이미지 → 짧은 영상 (.mp4, 소리 포함). `continue_from`으로 이전 영상 수정·연장 |
+| `generate_video` | 텍스트/이미지 → 짧은 영상 (.mp4, 소리 포함, Seedance 또는 Gemini). `continue_from`으로 이전 영상 수정·연장 |
 | `wait_for_images` | 50초 안에 안 끝난 작업(이미지·영상)을 이어서 받아옴 |
 | `list_recent` | 최근 결과 (코드, 경로, 프롬프트) |
 | `open_output_folder` | 결과 폴더를 탐색기/Finder로 열기 |
@@ -88,13 +90,30 @@ claude mcp add openai-image-local -s user -- "<폴더>/.venv/Scripts/python.exe"
 Gemini는 투명 배경을 만들지 못합니다. `size`에는 `1024x1024` 같은 값 외에 Gemini용 비율(`16:9`, `4:5`, `21:9` 등)도 넣을 수 있고,
 `quality: high`는 Gemini에서 2K 출력 + 깊은 추론입니다.
 
-## 영상 (`generate_video`, Gemini Omni Flash)
+## 영상 (`generate_video`)
 
-- 텍스트만 → 영상, 이미지 1장 → 첫 프레임, 2장 → 첫/마지막 프레임, 최대 3장을 인물·물건 레퍼런스로.
-- `aspect_ratio` 16:9 / 9:16, `resolution` 360p / 720p(기본) / 1080p / 4k(업스케일).
+`provider`로 영상 모델을 고릅니다. 기본(`auto`)은 Seedance이고, Seedance 키가 없으면 Gemini입니다.
+
+| 값 | 모델 | 잘하는 것 |
+|---|---|---|
+| `seedance` | `dreamina-seedance-2-5-260628` | **4~30초** 길이 지정(`duration`), 모든 비율(16:9, 9:16, 4:3, 3:4, 1:1, 21:9, 9:21, adaptive), 480p/720p/1080p, 첫/마지막 프레임 지정, 레퍼런스 이미지 최대 9장, 레퍼런스 영상(URL), 소리 켜기/끄기 |
+| `seedance-fast` | `dreamina-seedance-2-0-fast-260128` | 싸고 빠른 Seedance — 시안·테스트용 |
+| `gemini` | `gemini-omni-1.1-flash` | 자기가 만든 영상을 대화하듯 이어서 수정·연장, 360p~4k, 16:9 / 9:16만, 이미지 최대 3장 |
+
+- 이미지 1장 → 첫 프레임, 2장 → 첫/마지막 프레임, 3장 이상 → 인물·물건 레퍼런스.
+  Seedance는 `image_mode`(`first_frame` / `first_last` / `reference`)로 직접 정할 수 있습니다.
+  첫 프레임을 고정하지 않고 캐릭터만 유지하려면 1~2장이라도 `reference`.
+- Seedance는 영상의 **마지막 프레임을 이미지로 따로 저장**하고 코드를 줍니다. 다음 컷의 첫 이미지로 넣으면 컷이 자연스럽게 이어집니다.
 - 끝난 영상의 코드를 `continue_from`에 넣고 "밤으로 바꿔", "이어서 카메라가 뒤로 빠짐"처럼 바꿀 점만 쓰면 수정·연장됩니다.
+  Gemini는 대화 기록으로, Seedance는 원본 영상 링크를 레퍼런스 영상으로 넘겨서 처리합니다.
+  Seedance 결과 링크는 **약 24시간 뒤 만료**되므로 그 뒤에는 마지막 프레임 코드로 새로 이어 가세요.
+- `reference_videos`(Seedance): 움직임·카메라·편집 참고용 공개 http(s) 영상 URL 최대 3개. 내 PC의 mp4 파일은 직접 넘길 수 없습니다.
 - 1~5분 걸립니다. 결과는 `OUTPUT_DIR`에 `.mp4`로 저장되고 대화창 미리보기는 없습니다.
 - 네거티브 프롬프트가 없으니 피할 것은 프롬프트에 적습니다 ("no dialogue", "no text on screen").
+  Seedance는 "Shot 1: … Shot 2: …"처럼 컷별로 쓴 프롬프트를 잘 따릅니다.
+- 비용: Seedance 2.5는 토큰 과금이라 해상도·길이에 비례합니다(5초 16:9 기준 대략 480p 0.5달러, 720p 1.2달러, 1080p 2.8달러).
+  테스트는 480p나 `seedance-fast`로 하세요.
+- BytePlus ModelArk 콘솔에서 해당 모델을 **활성화(Activate)**해야 호출됩니다. 실제 사람 얼굴 사진은 입력이 거절될 수 있습니다.
 
 ## 레퍼런스 이미지 넘기는 법
 
@@ -157,12 +176,15 @@ a1b2c3d4 에서 신발만 빨간색으로
 영상 요청:
 
 ```json
-{"type": "video", "prompt": "...", "references": ["latest"], "aspect_ratio": "9:16",
- "resolution": "720p", "continue_from": "<이전 영상 코드, 선택>"}
+{"type": "video", "prompt": "...", "references": ["latest"], "provider": "auto",
+ "aspect_ratio": "9:16", "resolution": "720p", "duration": 8, "generate_audio": true,
+ "image_mode": "auto", "reference_videos": [], "continue_from": "<이전 영상 코드, 선택>"}
 ```
 
+`provider`: `auto`(Seedance 우선) / `seedance` / `seedance-fast` / `gemini`. `duration`·`image_mode`·`reference_videos`·`generate_audio`는 Seedance용입니다.
+
 결과 `outputs/<id>.result.json`: 이미지는 `{"status": "done", "media": "image", "code", "provider", "model", "image": {"id","name","url"}, "local_path", "seconds", ...}`,
-영상은 `"media": "video"`에 `"video": {"id","name","url"}` (`outputs/<id>.mp4`)
+영상은 `"media": "video"`에 `"video": {"id","name","url"}` (`outputs/<id>.mp4`), Seedance면 `"last_frame": {"code","id","name","url"}`도
 또는 `{"status": "error", "error": "..."}`. 드라이브 `openai_image_mcp/worker_status.json`의 `last_seen`이 몇 분 이상 지났으면
 PC가 꺼졌거나 잠들었거나 워커가 멈춘 것입니다.
 
@@ -193,6 +215,14 @@ PC가 꺼졌거나 잠들었거나 워커가 멈춘 것입니다.
 | `GEMINI_IMAGE_MODEL_PRO` | `gemini-3-pro-image` | `provider: gemini-pro` 모델 |
 | `GEMINI_VIDEO_MODEL` | `gemini-omni-1.1-flash` | 영상 모델 |
 | `GEMINI_TIMEOUT` / `GEMINI_VIDEO_TIMEOUT` | `240` / `900` | Gemini 요청 1건 최대 대기(초) |
+| `SEEDANCE_API_KEY` / `ARK_API_KEY` | | Seedance(BytePlus ModelArk) API 키 (있으면 우선) |
+| `SEEDANCE_API_KEY_FILE` | | Seedance 키 파일 경로. 없으면 OpenAI/Gemini 키 폴더 옆 `byteplus/`에서 자동 탐색 |
+| `SEEDANCE_API_BASE` | `https://ark.ap-southeast.bytepluses.com/api/v3` | 중국 Volcengine이면 `https://ark.cn-beijing.volces.com/api/v3` + `doubao-seedance-*` 모델 |
+| `SEEDANCE_MODEL` / `SEEDANCE_MODEL_FAST` | `dreamina-seedance-2-5-260628` / `dreamina-seedance-2-0-fast-260128` | `provider: seedance` / `seedance-fast` 모델 |
+| `SEEDANCE_TIMEOUT` | `1200` | Seedance 작업 1건 최대 대기(초) |
+| `SEEDANCE_MAX_IMAGES` | `9` | 영상 1건에 넣을 수 있는 이미지 수 |
+| `SEEDANCE_WATERMARK` | `0` | `1`이면 워터마크 |
+| `DEFAULT_VIDEO_PROVIDER` | `seedance` | `auto`일 때 기본 영상 모델 (`seedance` / `seedance-fast` / `gemini`) |
 | `DEFAULT_QUALITY` | `medium` | low / medium / high / auto |
 | `OPENAI_TIMEOUT` | `240` | OpenAI 요청 1건 최대 대기(초), 재시도 없음 |
 | `TOOL_WAIT_SECONDS` | `50` | 도구 호출 1번이 기다리는 시간 |

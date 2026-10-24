@@ -1,4 +1,4 @@
-"""openai_image_mcp_local — image (OpenAI gpt-image / Google Gemini) and video (Gemini)
+"""openai_image_mcp_local — image (OpenAI gpt-image / Google Gemini) and video (Seedance / Gemini)
 generation as a LOCAL (stdio) MCP server.
 
 For Claude Desktop / Claude Code on your own machine. No hosting, no upload page:
@@ -10,7 +10,8 @@ Tools
 - generate_image  : prompt (+ optional reference images) -> image
 - generate_batch  : several prompts sharing the same references, rendered in parallel
 - edit_image      : change an existing image, keeping the rest
-- generate_video  : prompt (+ optional images) -> short video with sound (Gemini Omni)
+- generate_video  : prompt (+ optional images / reference videos) -> short video with sound
+                    (Seedance 2.5 via BytePlus ModelArk, or Gemini Omni)
 - wait_for_images : collect results of jobs (images or videos) that took longer than one tool call
 - list_recent     : recent results (code, path, prompt)
 - open_output_folder : open the output folder in Explorer / Finder
@@ -65,6 +66,7 @@ def _load_dotenv(path: Path) -> None:
 _load_dotenv(HERE / ".env")
 
 import gemini  # noqa: E402  (reads its settings from the environment loaded above)
+import seedance  # noqa: E402
 
 MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", "medium")
@@ -387,11 +389,165 @@ async def _render(prompt: str, refs: list[tuple[str, bytes, str]], size: str, qu
 
 async def _render_video(prompt: str, images: list[tuple[str, bytes, str]], aspect_ratio: str, resolution: str,
                         previous: str | None, task: str | None) -> tuple[bytes, str]:
-    """-> (mp4 bytes, interaction id)"""
+    """Gemini Omni -> (mp4 bytes, interaction id)"""
     if BACKEND == "fake":
         await asyncio.sleep(FAKE_DELAY)
         return b"FAKE MP4 " + prompt[:200].encode(), "fake_" + uuid.uuid4().hex[:8]
     return await gemini.render_video(prompt, images, aspect_ratio, resolution, previous, task)
+
+
+# --------------------------------------------------------------------------
+# Video: Gemini Omni or Seedance, shared by the PC tool and the mobile worker
+# --------------------------------------------------------------------------
+VIDEO_PROVIDERS = ("auto", "gemini", "seedance", "seedance-fast")
+DEFAULT_VIDEO_PROVIDER = os.environ.get("DEFAULT_VIDEO_PROVIDER", "seedance").lower()
+GEMINI_RATIOS = ("16:9", "9:16")
+GEMINI_RESOLUTIONS = ("360p", "720p", "1080p", "4k")
+SEEDANCE_URL_HOURS = 23  # Seedance result links expire after ~24h
+
+
+class VideoSpec(dict):
+    """Validated video request (a dict so it can be logged / stored as-is)."""
+
+
+def _video_key(provider: str) -> bool:
+    if BACKEND == "fake":
+        return True
+    return seedance.available() if provider.startswith("seedance") else gemini.available()
+
+
+def pick_video_provider(requested: str | None, *, continued: dict | None, n_images: int, n_videos: int,
+                        aspect_ratio: str, resolution: str, duration: int | None, task: str | None) -> str:
+    """Resolve 'auto' for video.
+
+    auto: a continued video stays with the provider that made it; options only one provider has
+    decide it (Seedance: other ratios, 480p, duration, >3 images, reference videos; Gemini: 360p/4k,
+    task); otherwise DEFAULT_VIDEO_PROVIDER (seedance), falling back to whichever has an API key."""
+    req = (requested or "auto").lower()
+    if req not in VIDEO_PROVIDERS:
+        raise RefError(f"video provider must be one of {', '.join(VIDEO_PROVIDERS)} (got {requested}).")
+    if req == "auto":
+        if continued:
+            req = continued.get("provider") or "gemini"
+        elif (n_videos or n_images > gemini.VIDEO_MAX_IMAGES or aspect_ratio not in GEMINI_RATIOS
+              or resolution == "480p" or duration is not None):
+            req = "seedance"
+        elif resolution in ("360p", "4k") or task:
+            req = "gemini"
+        else:
+            req = DEFAULT_VIDEO_PROVIDER if DEFAULT_VIDEO_PROVIDER in VIDEO_PROVIDERS[1:] else "seedance"
+            if not _video_key(req):
+                other = "gemini" if req.startswith("seedance") else "seedance"
+                req = other if _video_key(other) else req
+    if not _video_key(req):
+        if req.startswith("seedance"):
+            raise RefError(f"No Seedance API key ({seedance.api_key()[1]}). Set SEEDANCE_API_KEY_FILE in "
+                           f"{HERE / '.env'}, or use provider 'gemini'.")
+        raise RefError(f"No Gemini API key ({gemini.api_key()[1]}). Set GEMINI_API_KEY_FILE in {HERE / '.env'}.")
+    return req
+
+
+def prepare_video(prompt: str, labels: list[str], files: list[tuple[str, bytes, str]], *, provider: str | None,
+                  aspect_ratio: str, resolution: str, duration: int | None = None, generate_audio: bool = True,
+                  image_mode: str = "auto", continue_from: str | None = None,
+                  reference_videos: list[str] | None = None, task: str | None = None) -> VideoSpec:
+    """Check a video request against what the chosen provider can do. Raises RefError."""
+    videos = [v.strip() for v in (reference_videos or []) if v and v.strip()]
+    for v in videos:
+        if not re.match(r"^https?://", v, re.I):
+            raise RefError(f"Reference videos must be public http(s) URLs (got {v}). For an earlier video from "
+                           "this server use continue_from=<its code>.")
+    continued = None
+    if continue_from:
+        continued = _find_code(continue_from)
+        if not continued or continued.get("media") != "video":
+            raise RefError(f"{continue_from} is not the code of a video made by this server (see list_recent).")
+    resolution = (resolution or "720p").lower()
+    prov = pick_video_provider(provider, continued=continued, n_images=len(files), n_videos=len(videos),
+                               aspect_ratio=aspect_ratio, resolution=resolution, duration=duration, task=task)
+    spec = VideoSpec(prompt=prompt, provider=prov, labels=labels, files=files, videos=videos,
+                     aspect_ratio=aspect_ratio, resolution=resolution, duration=duration,
+                     generate_audio=generate_audio, image_mode=image_mode or "auto", task=task,
+                     continue_from=continue_from, previous=None)
+
+    if prov == "gemini":
+        if continued and not continued.get("interaction_id"):
+            raise RefError(f"{continue_from} was made by {continued.get('provider')}; continue it with that provider.")
+        if videos:
+            raise RefError("Gemini does not take reference videos; use provider 'seedance'.")
+        if aspect_ratio not in GEMINI_RATIOS:
+            raise RefError(f"Gemini video is 16:9 or 9:16 only (got {aspect_ratio}); use provider 'seedance'.")
+        if resolution not in GEMINI_RESOLUTIONS:
+            raise RefError(f"Gemini video resolution is {', '.join(GEMINI_RESOLUTIONS)} (got {resolution}).")
+        if len(files) > gemini.VIDEO_MAX_IMAGES:
+            raise RefError(f"Gemini takes at most {gemini.VIDEO_MAX_IMAGES} images for a video; use 'seedance'.")
+        spec["previous"] = continued.get("interaction_id") if continued else None
+        spec["model"] = gemini.VIDEO_MODEL
+        return spec
+
+    # Seedance: a continued video goes back in as a reference video (its link lives ~24h)
+    if continued:
+        if not continued.get("video_url"):
+            raise RefError(f"{continue_from} was made by {continued.get('provider')}; continue it with that provider.")
+        age_h = (time.time() - continued.get("created", 0)) / 3600
+        if age_h > SEEDANCE_URL_HOURS:
+            hint = (f" Use its last frame `{continued['last_frame_code']}` as the first image of a new video instead."
+                    if continued.get("last_frame_code") else "")
+            raise RefError(f"The Seedance link of {continue_from} has expired ({age_h:.0f}h old, links last ~24h)."
+                           + hint)
+        spec["videos"] = [continued["video_url"]] + videos
+        if len(files) and image_mode not in ("auto", "reference"):
+            raise RefError("With continue_from, Seedance images can only be references (image_mode 'reference').")
+        spec["image_mode"] = "reference"
+    try:
+        seedance.build_body(prompt, files, spec["videos"], model="check", ratio=aspect_ratio, resolution=resolution,
+                            duration=duration, generate_audio=generate_audio, image_mode=spec["image_mode"])
+    except seedance.SeedanceError as e:
+        raise RefError(str(e))
+    spec["model"] = seedance.MODEL_FAST if prov == "seedance-fast" else seedance.MODEL
+    return spec
+
+
+async def render_video(spec: VideoSpec, request: str | None = None) -> tuple[bytes, dict]:
+    """Run a prepared video request -> (mp4 bytes, metadata for _save). A Seedance last frame is
+    saved as its own image (code in last_frame_code) so it can start the next shot."""
+    prov = spec["provider"]
+    common = {"media": "video", "provider": prov, "aspect_ratio": spec["aspect_ratio"],
+              "resolution": spec["resolution"], "continued_from": spec["continue_from"],
+              "references": spec["labels"]}
+    if prov == "gemini":
+        data, interaction = await _render_video(spec["prompt"], spec["files"], spec["aspect_ratio"],
+                                                spec["resolution"], spec["previous"], spec["task"])
+        return data, {**common, "model": gemini.VIDEO_MODEL if BACKEND != "fake" else "fake",
+                      "interaction_id": interaction}
+
+    if BACKEND == "fake":
+        await asyncio.sleep(FAKE_DELAY)
+        r = {"video": b"FAKE MP4 " + spec["prompt"][:200].encode(), "task_id": "fake_" + uuid.uuid4().hex[:8],
+             "model": "fake", "video_url": "https://example.invalid/fake.mp4", "duration": spec["duration"],
+             "ratio": spec["aspect_ratio"], "resolution": spec["resolution"], "seed": None,
+             "last_frame": _fake_image("LAST FRAME " + spec["prompt"], "1024x576")}
+    else:
+        r = await seedance.render_video(spec["prompt"], spec["files"], spec["videos"], ratio=spec["aspect_ratio"],
+                                        resolution=spec["resolution"], duration=spec["duration"],
+                                        generate_audio=spec["generate_audio"], image_mode=spec["image_mode"],
+                                        fast=prov == "seedance-fast")
+    meta = {**common, "model": r["model"], "task_id": r["task_id"], "video_url": r["video_url"],
+            "duration": r["duration"], "aspect_ratio": r["ratio"], "resolution": r["resolution"], "seed": r["seed"],
+            "generate_audio": spec["generate_audio"], "image_mode": spec["image_mode"],
+            "reference_videos": [v for v in spec["videos"] if v != r["video_url"]]}
+    if r.get("last_frame"):
+        try:
+            im = PILImage.open(io.BytesIO(r["last_frame"]))
+            fmt = "jpeg" if (im.format or "").lower() == "jpeg" else "png"
+            lf = _save(r["last_frame"], fmt, {"kind": "last_frame", "prompt": "last frame of: " + spec["prompt"],
+                                              "model": r["model"], "provider": prov, "task_id": r["task_id"]},
+                       (request + "_last") if request else None)
+            meta["last_frame_code"] = lf["id"][:8]
+            meta["last_frame_path"] = lf["path"]
+        except Exception as e:  # the video itself is what matters
+            log.warning("could not save the last frame of %s: %s", r["task_id"], e)
+    return r["video"], meta
 
 
 JOBS: dict[str, dict] = {}
@@ -454,7 +610,10 @@ async def _collect(job_ids: list[str], wait: float) -> list:
         m = res["meta"]
         via = f" | {m.get('model')}" if m.get("model") else ""
         if m.get("media") == "video":
-            texts.append(f"- {j}: VIDEO done in {m['seconds']}s{via} | code `{m['id'][:8]}` | saved: {m['path']}")
+            extra = f" | {m['duration']}s clip" if m.get("duration") else ""
+            if m.get("last_frame_code"):
+                extra += f" | last frame image `{m['last_frame_code']}`"
+            texts.append(f"- {j}: VIDEO done in {m['seconds']}s{via}{extra} | code `{m['id'][:8]}` | saved: {m['path']}")
             done_video = True
             continue
         texts.append(f"- {j}: done in {m['seconds']}s{via} | code `{m['id'][:8]}` | saved: {m['path']}")
@@ -474,7 +633,8 @@ async def _collect(job_ids: list[str], wait: float) -> list:
     if done_video:
         header.append(
             "Videos cannot be previewed here: give the user the saved .mp4 path. To change or lengthen a "
-            "video, call generate_video with continue_from=<its code>."
+            "video, call generate_video with continue_from=<its code>. A Seedance video's last frame image "
+            "code can be the first image of the next shot."
         )
     return ["\n".join(header + texts)] + images
 
@@ -484,7 +644,7 @@ async def _collect(job_ids: list[str], wait: float) -> list:
 # --------------------------------------------------------------------------
 INSTRUCTIONS = f"""\
 Local server that creates and edits images (OpenAI {MODEL} or Google Gemini) and short videos
-(Google {gemini.VIDEO_MODEL}). Results are saved to {OUTPUT_DIR}.
+(ByteDance Seedance or Google {gemini.VIDEO_MODEL}). Results are saved to {OUTPUT_DIR}.
 
 Choosing the image model (provider) — decide per request, it is your call
 - "openai" ({MODEL}): best at NEW pictures from a description — composition, illustration and
@@ -516,14 +676,26 @@ Prompts
   proportions. Show ..."
 - Keep any text that must appear in the image exactly as the user wrote it.
 
-Video (generate_video, Gemini only)
-- Text -> video, image -> video (one image = first frame, two = first and last frame, or up to 3 as
-  subject references), with generated sound. Describe camera, motion, mood and audio (or "no dialogue")
-  in the prompt; there is no negative prompt, so state what to avoid in the prompt.
+Video (generate_video) — choose the provider per request
+- "seedance" ({seedance.MODEL}, ByteDance Seedance via BytePlus ModelArk): the default. 4-30 s clips
+  (duration), any ratio (16:9, 9:16, 4:3, 3:4, 1:1, 21:9, adaptive), 480p/720p/1080p, strong motion and
+  multi-shot storytelling, first-frame / first+last-frame control, up to {seedance.MAX_IMAGES} reference
+  images for character / product consistency (image_mode "reference"), reference videos (public URLs)
+  for motion or editing, sound on/off (generate_audio). Returns the last frame as an image code too —
+  use it as the first image of the next shot for continuity.
+- "seedance-fast" ({seedance.MODEL_FAST}): cheaper / quicker Seedance for drafts and tests.
+- "gemini" ({gemini.VIDEO_MODEL}): multi-turn editing and extension of its own videos through
+  continue_from (it remembers the conversation), 360p-4k, 16:9 / 9:16 only, up to 3 images.
+- "auto": a continued video stays with its provider; Seedance-only or Gemini-only options decide;
+  otherwise {DEFAULT_VIDEO_PROVIDER}. Seedance cannot see this server's local videos except through
+  continue_from within ~24h of making them (its links expire).
+- Describe camera, motion, mood and audio (or "no dialogue") in the prompt; there is no negative prompt,
+  so state what to avoid in the prompt. Seedance follows shot-by-shot prompts well ("Shot 1: ... Shot 2: ...").
 - To change or lengthen a finished video, call generate_video again with continue_from=<its code> and
   only the change ("make it night", "extend: the camera pulls back").
 - A video takes about 1-5 minutes: the first call usually returns a job id; keep calling
-  wait_for_images with it. Videos are not previewed; give the user the .mp4 path.
+  wait_for_images with it. Videos are not previewed; give the user the .mp4 path. Use 480p or
+  seedance-fast for tests; long 1080p clips cost several dollars.
 
 Tools
 - One image: generate_image. Several related images: ONE generate_batch call (renders in parallel).
@@ -620,43 +792,59 @@ async def edit_image(
     return await _collect([job], WAIT_SECONDS)
 
 
+VideoProvider = Literal["auto", "gemini", "seedance", "seedance-fast"]
+
+
 @mcp.tool()
 async def generate_video(
     prompt: Annotated[str, Field(description="Detailed English description: subject, action, camera, style, sound. "
                                              "With continue_from: only the change or what happens next.")],
-    images: Annotated[list[str] | None, Field(description="0-3 images (same formats as reference_images). One = first "
-                                                         "frame; two = first and last frame; or subject references "
-                                                         "(say which in the prompt).")] = None,
-    aspect_ratio: Annotated[Literal["16:9", "9:16"], Field(description="16:9 landscape or 9:16 vertical.")] = "16:9",
-    resolution: Annotated[Literal["360p", "720p", "1080p", "4k"], Field(description="720p default; 1080p/4k are "
-                                                                                    "upscaled and slower.")] = "720p",
+    images: Annotated[list[str] | None, Field(description="Images (same formats as reference_images). Gemini: 0-3. "
+                                                         f"Seedance: 0-{seedance.MAX_IMAGES}. One = first frame; two = "
+                                                         "first and last frame; three or more = subject / style "
+                                                         "references (see image_mode).")] = None,
+    aspect_ratio: Annotated[Literal["16:9", "9:16", "4:3", "3:4", "1:1", "21:9", "9:21", "adaptive"],
+                            Field(description="Gemini: 16:9 or 9:16 only. Seedance: all; 'adaptive' follows the "
+                                              "first image.")] = "16:9",
+    resolution: Annotated[Literal["360p", "480p", "720p", "1080p", "4k"],
+                          Field(description="720p default. Gemini: 360p/720p/1080p/4k. Seedance: 480p/720p/1080p "
+                                            "(480p for cheap drafts).")] = "720p",
+    duration: Annotated[int | None, Field(description="Seedance only: clip length 4-30 seconds, or -1 to let the "
+                                                      "model decide. Omit for the model default (~5s).")] = None,
+    generate_audio: Annotated[bool, Field(description="Seedance: generate sound (default true). Gemini always "
+                                                      "makes sound; ask for 'no dialogue' etc. in the prompt.")] = True,
+    image_mode: Annotated[Literal["auto", "first_frame", "first_last", "reference"],
+                          Field(description="Seedance: how images are used. auto: 1 -> first frame, 2 -> first + "
+                                            "last frame, 3+ -> references. 'reference' keeps a character / product "
+                                            "consistent without fixing the first frame.")] = "auto",
+    reference_videos: Annotated[list[str] | None, Field(description="Seedance only: up to 3 public http(s) video "
+                                                                    "URLs for motion / camera / editing reference. "
+                                                                    "For this server's own videos use "
+                                                                    "continue_from.")] = None,
     continue_from: Annotated[str | None, Field(description="Code of an earlier video from this server, to edit or "
-                                                           "extend it (multi-turn).")] = None,
+                                                           "extend it. Stays with the provider that made it "
+                                                           "(Seedance: within ~24h).")] = None,
+    provider: Annotated[VideoProvider, Field(description="'seedance' (Seedance 2.5: 4-30s, any ratio, many "
+                                                         "references, first/last frame), 'seedance-fast' (cheaper "
+                                                         "and faster Seedance 2.0 Fast), 'gemini' (Gemini Omni: "
+                                                         "multi-turn edit / extend, 4k), or 'auto'.")] = "auto",
     task: Annotated[Literal["text_to_video", "image_to_video", "reference_to_video", "edit", "extend"] | None,
-                    Field(description="Optional; normally leave empty and let the prompt decide.")] = None,
+                    Field(description="Gemini only; normally leave empty and let the prompt decide.")] = None,
     filename: Annotated[str | None, Field(description="Optional file name (no extension) for the .mp4.")] = None,
 ) -> list:
-    """Make a short video with sound using Google Gemini Omni (text and/or images in, .mp4 out), or edit/extend an earlier one."""
-    if BACKEND != "fake" and not gemini.available():
-        return [f"No Gemini API key ({gemini.api_key()[1]}). Set GEMINI_API_KEY_FILE in {HERE / '.env'}."]
-    previous = None
-    if continue_from:
-        m = _find_code(continue_from)
-        if not m or m.get("media") != "video" or not m.get("interaction_id"):
-            return [f"{continue_from} is not the code of a video made by this server (see list_recent)."]
-        previous = m["interaction_id"]
+    """Make a short video with sound (Seedance or Gemini Omni; text and/or images in, .mp4 out), or edit/extend an earlier one."""
     try:
         labels, refs = await _load_refs(images)
+        spec = prepare_video(prompt, labels, refs, provider=provider, aspect_ratio=aspect_ratio,
+                             resolution=resolution, duration=duration, generate_audio=generate_audio,
+                             image_mode=image_mode, continue_from=continue_from,
+                             reference_videos=reference_videos, task=task)
     except RefError as e:
         return [str(e)]
-    if len(refs) > gemini.VIDEO_MAX_IMAGES:
-        return [f"Give at most {gemini.VIDEO_MAX_IMAGES} images for a video."]
 
     async def render() -> tuple[bytes, str, dict]:
-        data, interaction = await _render_video(prompt, refs, aspect_ratio, resolution, previous, task)
-        return data, "mp4", {"media": "video", "model": gemini.VIDEO_MODEL if BACKEND != "fake" else "fake",
-                             "provider": "gemini", "aspect_ratio": aspect_ratio, "resolution": resolution,
-                             "interaction_id": interaction, "continued_from": continue_from}
+        data, meta = await render_video(spec, filename)
+        return data, "mp4", meta
 
     job = _start("video", prompt, labels, filename, render)
     return await _collect([job], WAIT_SECONDS)
@@ -710,13 +898,16 @@ def main() -> None:
     if BACKEND == "openai":
         key, source = _api_key()
         gkey, gsource = gemini.api_key()
+        skey, ssource = seedance.api_key()
         log.info("OpenAI key: %s", source if key else "MISSING (" + source + ")")
         log.info("Gemini key: %s", gsource if gkey else "MISSING (" + gsource + ")")
+        log.info("Seedance key: %s", ssource if skey else "MISSING (" + ssource + ")")
         if not key and not gkey:
-            log.error("No API key at all. Set OPENAI_API_KEY_FILE and/or GEMINI_API_KEY_FILE in %s "
+            log.error("No image API key. Set OPENAI_API_KEY_FILE and/or GEMINI_API_KEY_FILE in %s "
                       "or the MCP config 'env'.", HERE / ".env")
-    log.info("openai_image_mcp_local: openai=%s gemini=%s/%s video=%s backend=%s output=%s", MODEL,
-             gemini.IMAGE_MODEL, gemini.IMAGE_MODEL_PRO, gemini.VIDEO_MODEL, BACKEND, OUTPUT_DIR)
+    log.info("openai_image_mcp_local: openai=%s gemini=%s/%s video=%s,%s/%s (default %s) backend=%s output=%s",
+             MODEL, gemini.IMAGE_MODEL, gemini.IMAGE_MODEL_PRO, seedance.MODEL, seedance.MODEL_FAST,
+             gemini.VIDEO_MODEL, DEFAULT_VIDEO_PROVIDER, BACKEND, OUTPUT_DIR)
     mcp.run("stdio")
 
 

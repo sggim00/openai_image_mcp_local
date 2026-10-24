@@ -2,7 +2,7 @@
 
 On the phone, Claude cannot see this PC's MCP tools, so it uses the Google Drive connector:
 it drops a request JSON into Drive, this worker (running on the PC) picks it up, renders
-with the same code as server.py (OpenAI or Gemini images, Gemini video), and puts the
+with the same code as server.py (OpenAI or Gemini images, Seedance or Gemini video), and puts the
 image / video + a result JSON back in Drive. The
 image is also saved to OUTPUT_DIR with a short code, shared with the PC tools.
 
@@ -195,7 +195,7 @@ class Worker:
         if isinstance(refs, str):
             refs = [refs]
         is_video = str(req.get("type") or req.get("media") or "image").lower() == "video"
-        limit = core.gemini.VIDEO_MAX_IMAGES if is_video else core.MAX_REFS
+        limit = max(core.seedance.MAX_IMAGES, core.gemini.VIDEO_MAX_IMAGES) if is_video else core.MAX_REFS
         if len(refs) > limit:
             raise RequestError(f"Too many references ({len(refs)}); the limit is {limit}.")
         labels, files = [], []
@@ -229,38 +229,50 @@ class Worker:
                 "local_path": meta["path"]}
 
     async def process_video(self, req: dict, rid: str, prompt: str, labels: list[str], files: list) -> dict:
-        if core.BACKEND != "fake" and not core.gemini.available():
-            raise RequestError(f"No Gemini API key on the PC ({core.gemini.api_key()[1]}).")
-        aspect = str(req.get("aspect_ratio") or "16:9")
-        if aspect not in ("16:9", "9:16"):
-            raise RequestError(f"aspect_ratio must be 16:9 or 9:16 (got {aspect}).")
-        resolution = str(req.get("resolution") or "720p").lower()
-        if resolution not in ("360p", "720p", "1080p", "4k"):
-            raise RequestError(f"resolution must be 360p, 720p, 1080p or 4k (got {resolution}).")
-        previous = None
-        if req.get("continue_from"):
-            m = core._find_code(str(req["continue_from"]))
-            if not m or m.get("media") != "video" or not m.get("interaction_id"):
-                raise RequestError(f"{req['continue_from']} is not the code of an earlier video.")
-            previous = m["interaction_id"]
+        duration = req.get("duration")
+        try:
+            duration = int(duration) if duration not in (None, "") else None
+        except (TypeError, ValueError):
+            raise RequestError(f"duration must be a number of seconds (got {duration}).")
+        videos = req.get("reference_videos") or []
+        if isinstance(videos, str):
+            videos = [videos]
+        try:
+            spec = core.prepare_video(
+                prompt, labels, files, provider=req.get("provider"),
+                aspect_ratio=str(req.get("aspect_ratio") or "16:9"),
+                resolution=str(req.get("resolution") or "720p"), duration=duration,
+                generate_audio=req.get("generate_audio", True) not in (False, "false", "0", 0),
+                image_mode=str(req.get("image_mode") or "auto"),
+                continue_from=str(req["continue_from"]) if req.get("continue_from") else None,
+                reference_videos=[str(v) for v in videos], task=req.get("task"))
+        except core.RefError as e:
+            raise RequestError(str(e))
         t0 = time.time()
         try:
-            data, interaction = await core._render_video(prompt, files, aspect, resolution, previous, req.get("task"))
+            data, extra = await core.render_video(spec, rid)
         except Exception as e:
-            raise RequestError(f"gemini video: {type(e).__name__}: {e}")
+            raise RequestError(f"{spec['provider']} video: {type(e).__name__}: {e}")
         seconds = round(time.time() - t0, 1)
-        model = core.gemini.VIDEO_MODEL if core.BACKEND != "fake" else "fake"
-        meta = core._save(data, "mp4", {"kind": "mobile", "media": "video", "prompt": prompt, "model": model,
-                                        "provider": "gemini", "aspect_ratio": aspect, "resolution": resolution,
-                                        "interaction_id": interaction, "continued_from": req.get("continue_from"),
-                                        "references": labels, "seconds": seconds, "request": rid}, rid)
+        meta = core._save(data, "mp4", {"kind": "mobile", "prompt": prompt, **extra, "seconds": seconds,
+                                        "request": rid}, rid)
         code = meta["id"][:8]
         vid = await self.call(self.drive.upload, data, f"{rid}.mp4", "video/mp4", self.f["outputs"],
                               {"code": code, "kind": "mobile"}, prompt)
-        return {"status": "done", "media": "video", "code": code, "prompt": prompt, "provider": "gemini",
-                "model": model, "aspect_ratio": aspect, "resolution": resolution, "references": labels,
-                "seconds": seconds, "video": {"id": vid["id"], "name": vid["name"], "url": vid.get("webViewLink")},
-                "local_path": meta["path"]}
+        result = {"status": "done", "media": "video", "code": code, "prompt": prompt, "provider": spec["provider"],
+                  "model": extra.get("model"), "aspect_ratio": extra.get("aspect_ratio"),
+                  "resolution": extra.get("resolution"), "duration": extra.get("duration"), "references": labels,
+                  "seconds": seconds, "video": {"id": vid["id"], "name": vid["name"], "url": vid.get("webViewLink")},
+                  "local_path": meta["path"]}
+        if extra.get("last_frame_path"):
+            p = Path(extra["last_frame_path"])
+            ext = p.suffix.lstrip(".").lower()
+            mime = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+            lf = await self.call(self.drive.upload, p.read_bytes(), f"{rid}_last.{ext}", mime, self.f["outputs"],
+                                 {"code": extra["last_frame_code"], "kind": "last_frame"}, "last frame of: " + prompt)
+            result["last_frame"] = {"code": extra["last_frame_code"], "id": lf["id"], "name": lf["name"],
+                                    "url": lf.get("webViewLink")}
+        return result
 
     def read_request(self, item: dict) -> dict:
         if item.get("mimeType") == "application/vnd.google-apps.document":
@@ -483,6 +495,8 @@ def cmd_check() -> int:
     print(f"OpenAI key: {'ok (' + src + ')' if key else 'MISSING — ' + src}")
     gkey, gsrc = core.gemini.api_key()
     print(f"Gemini key: {'ok (' + gsrc + ')' if gkey else 'MISSING — ' + gsrc}  (Gemini images + video)")
+    skey, ssrc = core.seedance.api_key()
+    print(f"Seedance key: {'ok (' + ssrc + ')' if skey else 'MISSING — ' + ssrc}  (Seedance video)")
     ok &= bool(key or gkey) or core.BACKEND == "fake"
     try:
         w = Worker(Drive.from_file(TOKEN_FILE))
