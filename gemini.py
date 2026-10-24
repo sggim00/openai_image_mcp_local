@@ -17,7 +17,10 @@ import re
 import time
 from pathlib import Path
 
-import httpx
+try:
+    import httpx
+except ImportError:  # openai>=3 installs httpx2 (same API) instead of httpx
+    import httpx2 as httpx
 
 API = os.environ.get("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
 IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-nano-banana-2.1")

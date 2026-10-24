@@ -21,7 +21,10 @@ import re
 import time
 from pathlib import Path
 
-import httpx
+try:
+    import httpx
+except ImportError:  # openai>=3 installs httpx2 (same API) instead of httpx
+    import httpx2 as httpx
 
 # BytePlus ModelArk (international). For Volcengine Ark (China) use
 # SEEDANCE_API_BASE=https://ark.cn-beijing.volces.com/api/v3 and doubao-seedance-* model ids.

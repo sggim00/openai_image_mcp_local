@@ -468,7 +468,7 @@ def _public_link(file_id: str) -> str:
 
 async def _check_public(url: str) -> None:
     """Make sure the temporary link really serves the video without a login (sharing takes a moment)."""
-    import httpx
+    httpx = seedance.httpx
 
     last = ""
     for _ in range(6):
