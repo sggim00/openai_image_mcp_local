@@ -191,6 +191,22 @@ def _error_text(r: httpx.Response) -> str:
     return f"HTTP {r.status_code}: {msg}"
 
 
+async def probe() -> str:
+    """Free connectivity check: list one task. Returns a short status line."""
+    key, source = api_key()
+    if not key:
+        return f"MISSING key — {source}"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=15)) as c:
+            r = await c.get(f"{API}/contents/generations/tasks", headers=_headers(),
+                            params={"page_num": 1, "page_size": 1})
+    except httpx.HTTPError as e:
+        return f"key ok ({source}) but cannot reach {API}: {type(e).__name__}: {e}"
+    if r.status_code >= 400:
+        return f"key from {source} REJECTED — {_error_text(r)}"
+    return f"ok — key {source}, API reachable ({API})"
+
+
 # --------------------------------------------------------------------------
 # Public call
 # --------------------------------------------------------------------------

@@ -168,6 +168,19 @@ class Drive:
         return self.request("PATCH", f"{self.upload_api}/{file_id}",
                             {"uploadType": "media", "fields": FIELDS, "supportsAllDrives": "true"}, data, mime)
 
+    def share_anyone(self, file_id: str) -> str:
+        """Let anyone with the link read the file. Returns the permission id (for unshare)."""
+        body = json.dumps({"type": "anyone", "role": "reader"}).encode()
+        d = self.request("POST", f"{self.api}/files/{file_id}/permissions", {"supportsAllDrives": "true"},
+                         body, "application/json; charset=UTF-8")
+        return d.get("id", "anyoneWithLink")
+
+    def unshare(self, file_id: str, permission_id: str) -> None:
+        self.request("DELETE", f"{self.api}/files/{file_id}/permissions/{permission_id}", {"supportsAllDrives": "true"})
+
+    def delete(self, file_id: str) -> None:
+        self.request("DELETE", f"{self.api}/files/{file_id}", {"supportsAllDrives": "true"})
+
     def update(self, file_id: str, add_parent: str | None = None, remove_parent: str | None = None,
                props: dict | None = None) -> dict:
         params = {"fields": FIELDS, "supportsAllDrives": "true"}

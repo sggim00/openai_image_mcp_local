@@ -68,6 +68,7 @@ _load_dotenv(HERE / ".env")
 import gemini  # noqa: E402  (reads its settings from the environment loaded above)
 import seedance  # noqa: E402
 
+VERSION = "2026.10.24-seedance2"
 MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", "medium")
 BACKEND = os.environ.get("IMAGE_BACKEND", "openai")  # "openai" | "fake" (testing, no API calls)
@@ -410,6 +411,128 @@ class VideoSpec(dict):
     """Validated video request (a dict so it can be logged / stored as-is)."""
 
 
+# Seedance only reads reference videos from public URLs. A local file (e.g. a Maya playblast), an
+# earlier video's code, or a Drive file is shared through a temporary "anyone with the link" Google
+# Drive link for the length of the task, then deleted / unshared again.
+VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+DRIVE_FILE_RE = re.compile(r"drive\.google\.com/.*(?:/d/|[?&]id=)([A-Za-z0-9_-]{20,})")
+GDRIVE_TOKEN = Path(os.path.expandvars(os.path.expanduser(
+    os.environ.get("GDRIVE_TOKEN_FILE", str(HERE / ".gdrive_token.json")))))
+MAX_REF_VIDEO_MB = 50
+
+
+def _drive_ready() -> bool:
+    return GDRIVE_TOKEN.is_file()
+
+
+def _drive_client():
+    from gdrive import Drive
+
+    return Drive.from_file(GDRIVE_TOKEN)
+
+
+def _resolve_video_ref(ref: str) -> str | dict:
+    """http(s) URL -> as is; Drive link -> {"drive": id}; local file or earlier video code -> {"local": path}."""
+    s = ref.strip().strip('"').strip("'")
+    m = DRIVE_FILE_RE.search(s)
+    if m:
+        if not _drive_ready():
+            raise RefError("Drive links need Google Drive set up on the PC (setup_mobile.bat).")
+        return {"drive": m.group(1), "label": s}
+    if re.match(r"^https?://", s, re.I):
+        return s
+    p = Path(os.path.expandvars(os.path.expanduser(s)))
+    if not p.is_absolute() and (OUTPUT_DIR / p).exists():
+        p = OUTPUT_DIR / p
+    if not p.is_file():
+        hit = _find_code(s)
+        if hit and hit.get("media") == "video":
+            p = Path(hit["path"])
+        else:
+            raise RefError(f"Reference video not found: {ref}. Give a local .mp4/.mov path, the code of an earlier "
+                           "video, a Google Drive link or a public http(s) URL.")
+    if p.suffix.lower() not in VIDEO_EXTS:
+        raise RefError(f"{p.name} is not a video ({', '.join(VIDEO_EXTS)}).")
+    if p.stat().st_size > MAX_REF_VIDEO_MB * 1024 * 1024:
+        raise RefError(f"{p.name} is {p.stat().st_size / 2**20:.0f} MB; keep reference videos under "
+                       f"{MAX_REF_VIDEO_MB} MB (shorter or 720p).")
+    if not _drive_ready():
+        raise RefError("Seedance can only read videos from a public link. To use a local video, set up Google "
+                       "Drive on the PC (setup_mobile.bat) so a temporary link can be made, or give a public URL.")
+    return {"local": str(p), "label": str(p)}
+
+
+def _public_link(file_id: str) -> str:
+    return f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+
+
+async def _check_public(url: str) -> None:
+    """Make sure the temporary link really serves the video without a login (sharing takes a moment)."""
+    import httpx
+
+    last = ""
+    for _ in range(6):
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+                r = await c.get(url, headers={"Range": "bytes=0-1023"})
+            ctype = r.headers.get("content-type", "")
+            if r.status_code in (200, 206) and "text/html" not in ctype:
+                return
+            last = f"HTTP {r.status_code} {ctype}"
+        except httpx.HTTPError as e:
+            last = str(e)
+        await asyncio.sleep(2)
+    raise RuntimeError(f"the temporary Drive link is not publicly readable ({last}). Your Google account may block "
+                       "'anyone with the link' sharing; use a public URL instead.")
+
+
+async def _video_urls(videos: list) -> tuple[list[str], callable]:
+    """Turn prepared video refs into URLs Seedance can download. Returns (urls, cleanup)."""
+    urls: list[str] = []
+    undo: list = []
+
+    def cleanup() -> None:
+        for fn in reversed(undo):
+            try:
+                fn()
+            except Exception as e:
+                log.warning("temporary Drive link cleanup failed: %s", e)
+
+    if all(isinstance(v, str) for v in videos):
+        return list(videos), cleanup
+    drive = await asyncio.to_thread(_drive_client)
+    try:
+        folder = None
+        for v in videos:
+            if isinstance(v, str):
+                urls.append(v)
+                continue
+            if "local" in v:
+                if folder is None:
+                    root = os.environ.get("GDRIVE_FOLDER_ID", "").strip() or (await asyncio.to_thread(
+                        drive.ensure_folder, os.environ.get("GDRIVE_ROOT_NAME", "openai_image_mcp"), "root"))["id"]
+                    folder = (await asyncio.to_thread(drive.ensure_folder, "temp_video_refs", root))["id"]
+                p = Path(v["local"])
+                mime = {".mov": "video/quicktime", ".webm": "video/webm"}.get(p.suffix.lower(), "video/mp4")
+                f = await asyncio.to_thread(drive.upload, p.read_bytes(), f"{uuid.uuid4().hex[:8]}_{p.name}", mime,
+                                            folder, {"kind": "temp_video_ref"})
+                undo.append(lambda fid=f["id"]: drive.delete(fid))
+                await asyncio.to_thread(drive.share_anyone, f["id"])
+                fid = f["id"]
+            else:
+                fid = v["drive"]
+                perm = await asyncio.to_thread(drive.share_anyone, fid)
+                undo.append(lambda fid=fid, perm=perm: drive.unshare(fid, perm))
+            url = _public_link(fid)
+            await _check_public(url)
+            log.info("temporary public link for %s", v.get("label"))
+            urls.append(url)
+    except Exception:
+        await asyncio.to_thread(cleanup)
+        raise
+    return urls, cleanup
+
+
 def _video_key(provider: str) -> bool:
     if BACKEND == "fake":
         return True
@@ -452,11 +575,7 @@ def prepare_video(prompt: str, labels: list[str], files: list[tuple[str, bytes, 
                   image_mode: str = "auto", continue_from: str | None = None,
                   reference_videos: list[str] | None = None, task: str | None = None) -> VideoSpec:
     """Check a video request against what the chosen provider can do. Raises RefError."""
-    videos = [v.strip() for v in (reference_videos or []) if v and v.strip()]
-    for v in videos:
-        if not re.match(r"^https?://", v, re.I):
-            raise RefError(f"Reference videos must be public http(s) URLs (got {v}). For an earlier video from "
-                           "this server use continue_from=<its code>.")
+    videos = [_resolve_video_ref(v) for v in (reference_videos or []) if v and v.strip()]
     continued = None
     if continue_from:
         continued = _find_code(continue_from)
@@ -490,17 +609,22 @@ def prepare_video(prompt: str, labels: list[str], files: list[tuple[str, bytes, 
         if not continued.get("video_url"):
             raise RefError(f"{continue_from} was made by {continued.get('provider')}; continue it with that provider.")
         age_h = (time.time() - continued.get("created", 0)) / 3600
-        if age_h > SEEDANCE_URL_HOURS:
+        if age_h <= SEEDANCE_URL_HOURS:
+            first: str | dict = continued["video_url"]
+        elif _drive_ready():  # link expired: hand Seedance the local copy through a temporary Drive link
+            first = {"local": continued["path"], "label": continue_from}
+        else:
             hint = (f" Use its last frame `{continued['last_frame_code']}` as the first image of a new video instead."
                     if continued.get("last_frame_code") else "")
-            raise RefError(f"The Seedance link of {continue_from} has expired ({age_h:.0f}h old, links last ~24h)."
-                           + hint)
-        spec["videos"] = [continued["video_url"]] + videos
+            raise RefError(f"The Seedance link of {continue_from} has expired ({age_h:.0f}h old, links last ~24h) "
+                           "and Google Drive is not set up for temporary links." + hint)
+        spec["videos"] = [first] + videos
         if len(files) and image_mode not in ("auto", "reference"):
             raise RefError("With continue_from, Seedance images can only be references (image_mode 'reference').")
         spec["image_mode"] = "reference"
     try:
-        seedance.build_body(prompt, files, spec["videos"], model="check", ratio=aspect_ratio, resolution=resolution,
+        placeholders = [v if isinstance(v, str) else "https://check.invalid/v.mp4" for v in spec["videos"]]
+        seedance.build_body(prompt, files, placeholders, model="check", ratio=aspect_ratio, resolution=resolution,
                             duration=duration, generate_audio=generate_audio, image_mode=spec["image_mode"])
     except seedance.SeedanceError as e:
         raise RefError(str(e))
@@ -528,14 +652,18 @@ async def render_video(spec: VideoSpec, request: str | None = None) -> tuple[byt
              "ratio": spec["aspect_ratio"], "resolution": spec["resolution"], "seed": None,
              "last_frame": _fake_image("LAST FRAME " + spec["prompt"], "1024x576")}
     else:
-        r = await seedance.render_video(spec["prompt"], spec["files"], spec["videos"], ratio=spec["aspect_ratio"],
-                                        resolution=spec["resolution"], duration=spec["duration"],
-                                        generate_audio=spec["generate_audio"], image_mode=spec["image_mode"],
-                                        fast=prov == "seedance-fast")
+        urls, cleanup = await _video_urls(spec["videos"])
+        try:
+            r = await seedance.render_video(spec["prompt"], spec["files"], urls, ratio=spec["aspect_ratio"],
+                                            resolution=spec["resolution"], duration=spec["duration"],
+                                            generate_audio=spec["generate_audio"], image_mode=spec["image_mode"],
+                                            fast=prov == "seedance-fast")
+        finally:
+            await asyncio.to_thread(cleanup)
     meta = {**common, "model": r["model"], "task_id": r["task_id"], "video_url": r["video_url"],
             "duration": r["duration"], "aspect_ratio": r["ratio"], "resolution": r["resolution"], "seed": r["seed"],
             "generate_audio": spec["generate_audio"], "image_mode": spec["image_mode"],
-            "reference_videos": [v for v in spec["videos"] if v != r["video_url"]]}
+            "reference_videos": [v if isinstance(v, str) else v.get("label") for v in spec["videos"]]}
     if r.get("last_frame"):
         try:
             im = PILImage.open(io.BytesIO(r["last_frame"]))
@@ -680,8 +808,15 @@ Video (generate_video) — choose the provider per request
 - "seedance" ({seedance.MODEL}, ByteDance Seedance via BytePlus ModelArk): the default. 4-30 s clips
   (duration), any ratio (16:9, 9:16, 4:3, 3:4, 1:1, 21:9, adaptive), 480p/720p/1080p, strong motion and
   multi-shot storytelling, first-frame / first+last-frame control, up to {seedance.MAX_IMAGES} reference
-  images for character / product consistency (image_mode "reference"), reference videos (public URLs)
-  for motion or editing, sound on/off (generate_audio). Returns the last frame as an image code too —
+  images for character / product consistency (image_mode "reference"), reference videos for motion,
+  camera or editing, sound on/off (generate_audio).
+- Video-to-video (e.g. turn a gray Maya playblast into photoreal footage): put the local .mp4 path in
+  reference_videos, keep duration close to the source length, aspect_ratio matching the source, and say in
+  the prompt "Use the reference video as the exact motion, camera and structure reference: keep the same
+  mechanical design, proportions, joint layout and timing; only change materials, lighting and
+  environment to ...". Local files go to Seedance through a temporary public Drive link that is removed
+  afterwards; tell the user that once.
+- check_setup tests the keys and the Seedance connection without spending credit. Returns the last frame as an image code too —
   use it as the first image of the next shot for continuity.
 - "seedance-fast" ({seedance.MODEL_FAST}): cheaper / quicker Seedance for drafts and tests.
 - "gemini" ({gemini.VIDEO_MODEL}): multi-turn editing and extension of its own videos through
@@ -817,10 +952,13 @@ async def generate_video(
                           Field(description="Seedance: how images are used. auto: 1 -> first frame, 2 -> first + "
                                             "last frame, 3+ -> references. 'reference' keeps a character / product "
                                             "consistent without fixing the first frame.")] = "auto",
-    reference_videos: Annotated[list[str] | None, Field(description="Seedance only: up to 3 public http(s) video "
-                                                                    "URLs for motion / camera / editing reference. "
-                                                                    "For this server's own videos use "
-                                                                    "continue_from.")] = None,
+    reference_videos: Annotated[list[str] | None, Field(description="Seedance only: up to 3 videos for motion / "
+                                                                    "camera / structure reference or video-to-video "
+                                                                    "restyling: a local .mp4/.mov path (e.g. a Maya "
+                                                                    "playblast), the code of an earlier video, a "
+                                                                    "Google Drive link, or a public http(s) URL. "
+                                                                    "Local / Drive files get a temporary public Drive "
+                                                                    "link that is removed after the task.")] = None,
     continue_from: Annotated[str | None, Field(description="Code of an earlier video from this server, to edit or "
                                                            "extend it. Stays with the provider that made it "
                                                            "(Seedance: within ~24h).")] = None,
@@ -877,6 +1015,23 @@ def list_recent(limit: Annotated[int, Field(ge=1, le=50)] = 10) -> str:
     if not items:
         return f"No images yet. Output folder: {OUTPUT_DIR}"
     return json.dumps(items, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def check_setup() -> str:
+    """Check which providers work: API keys, a free Seedance connection test, Google Drive, server version."""
+    key, src = _api_key()
+    gkey, gsrc = gemini.api_key()
+    lines = [
+        f"server version: {VERSION}",
+        f"OpenAI (images): {'ok — ' + src if key else 'MISSING — ' + src}",
+        f"Gemini (images + video): {'ok — ' + gsrc if gkey else 'MISSING — ' + gsrc}",
+        f"Seedance (video): {await seedance.probe() if BACKEND != 'fake' else 'fake backend'}",
+        f"Google Drive (temporary links for local reference videos, mobile worker): "
+        f"{'ready — ' + str(GDRIVE_TOKEN) if _drive_ready() else 'not set up (run setup_mobile.bat)'}",
+        f"default video provider: {DEFAULT_VIDEO_PROVIDER}; output folder: {OUTPUT_DIR}",
+    ]
+    return "\n".join(lines)
 
 
 @mcp.tool()

@@ -75,6 +75,7 @@ claude mcp add openai-image-local -s user -- "<폴더>/.venv/Scripts/python.exe"
 | `wait_for_images` | 50초 안에 안 끝난 작업(이미지·영상)을 이어서 받아옴 |
 | `list_recent` | 최근 결과 (코드, 경로, 프롬프트) |
 | `open_output_folder` | 결과 폴더를 탐색기/Finder로 열기 |
+| `check_setup` | 키·Seedance 연결(크레딧 안 씀)·드라이브 연결·서버 버전 확인 |
 
 ## 모델 선택 (`provider`)
 
@@ -107,7 +108,13 @@ Gemini는 투명 배경을 만들지 못합니다. `size`에는 `1024x1024` 같�
 - 끝난 영상의 코드를 `continue_from`에 넣고 "밤으로 바꿔", "이어서 카메라가 뒤로 빠짐"처럼 바꿀 점만 쓰면 수정·연장됩니다.
   Gemini는 대화 기록으로, Seedance는 원본 영상 링크를 레퍼런스 영상으로 넘겨서 처리합니다.
   Seedance 결과 링크는 **약 24시간 뒤 만료**되므로 그 뒤에는 마지막 프레임 코드로 새로 이어 가세요.
-- `reference_videos`(Seedance): 움직임·카메라·편집 참고용 공개 http(s) 영상 URL 최대 3개. 내 PC의 mp4 파일은 직접 넘길 수 없습니다.
+- `reference_videos`(Seedance): 움직임·카메라·구조 참고 또는 영상→영상 변환용 영상 최대 3개.
+  **로컬 .mp4/.mov 경로**(예: Maya playblast), 이전 영상 코드, 구글 드라이브 링크, 공개 http(s) URL 모두 됩니다.
+  Seedance는 공개 링크로만 영상을 읽으므로, 로컬·드라이브 파일은 드라이브에 잠깐 올려 "링크가 있는 모든 사용자" 공유 링크를 만들고
+  작업이 끝나면(실패해도) 바로 지우거나 공유를 해제합니다. 모바일 설정(`setup_mobile.bat`)으로 드라이브가 연결돼 있어야 합니다. 50MB 이하.
+- 예: 회색 playblast → 실사. `reference_videos`에 playblast 경로, 원본과 같은 비율·비슷한 길이, 프롬프트에
+  "레퍼런스 영상의 움직임·카메라·기계 구조를 그대로 유지하고 재질·조명·배경만 실사로" 를 명시.
+- Seedance 24시간 링크가 만료된 영상도 `continue_from`이면 PC에 있는 mp4를 같은 방식으로 다시 넘겨 이어 갑니다.
 - 1~5분 걸립니다. 결과는 `OUTPUT_DIR`에 `.mp4`로 저장되고 대화창 미리보기는 없습니다.
 - 네거티브 프롬프트가 없으니 피할 것은 프롬프트에 적습니다 ("no dialogue", "no text on screen").
   Seedance는 "Shot 1: … Shot 2: …"처럼 컷별로 쓴 프롬프트를 잘 따릅니다.

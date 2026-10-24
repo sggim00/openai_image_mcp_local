@@ -495,8 +495,7 @@ def cmd_check() -> int:
     print(f"OpenAI key: {'ok (' + src + ')' if key else 'MISSING — ' + src}")
     gkey, gsrc = core.gemini.api_key()
     print(f"Gemini key: {'ok (' + gsrc + ')' if gkey else 'MISSING — ' + gsrc}  (Gemini images + video)")
-    skey, ssrc = core.seedance.api_key()
-    print(f"Seedance key: {'ok (' + ssrc + ')' if skey else 'MISSING — ' + ssrc}  (Seedance video)")
+    print(f"Seedance: {asyncio.run(core.seedance.probe())}  (Seedance video)")
     ok &= bool(key or gkey) or core.BACKEND == "fake"
     try:
         w = Worker(Drive.from_file(TOKEN_FILE))
