@@ -68,7 +68,7 @@ _load_dotenv(HERE / ".env")
 import gemini  # noqa: E402  (reads its settings from the environment loaded above)
 import seedance  # noqa: E402
 
-VERSION = "2026.10.25-seedance3"
+VERSION = "2026.10.25-gemini-v2v"
 MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", "medium")
 BACKEND = os.environ.get("IMAGE_BACKEND", "openai")  # "openai" | "fake" (testing, no API calls)
@@ -389,12 +389,13 @@ async def _render(prompt: str, refs: list[tuple[str, bytes, str]], size: str, qu
 
 
 async def _render_video(prompt: str, images: list[tuple[str, bytes, str]], aspect_ratio: str, resolution: str,
-                        previous: str | None, task: str | None) -> tuple[bytes, str]:
+                        previous: str | None, task: str | None,
+                        videos: list[tuple[str, bytes, str]] | None = None) -> tuple[bytes, str]:
     """Gemini Omni -> (mp4 bytes, interaction id)"""
     if BACKEND == "fake":
         await asyncio.sleep(FAKE_DELAY)
         return b"FAKE MP4 " + prompt[:200].encode(), "fake_" + uuid.uuid4().hex[:8]
-    return await gemini.render_video(prompt, images, aspect_ratio, resolution, previous, task)
+    return await gemini.render_video(prompt, images, aspect_ratio, resolution, previous, task, videos)
 
 
 # --------------------------------------------------------------------------
@@ -431,7 +432,26 @@ def _drive_client():
     return Drive.from_file(GDRIVE_TOKEN)
 
 
-def _resolve_video_ref(ref: str) -> str | dict:
+def _video_seconds(p: Path) -> float | None:
+    """Duration of an .mp4/.mov from its mvhd box (no ffmpeg needed)."""
+    try:
+        import struct
+
+        data = p.read_bytes()
+        i = data.find(b"mvhd")
+        if i < 0:
+            return None
+        ver = data[i + 4]
+        if ver == 1:
+            scale, dur = struct.unpack(">IQ", data[i + 24:i + 36])
+        else:
+            scale, dur = struct.unpack(">II", data[i + 16:i + 24])
+        return dur / scale if scale else None
+    except Exception:
+        return None
+
+
+def _resolve_video_ref(ref: str, need_public: bool = True) -> str | dict:
     """http(s) URL -> as is; Drive link -> {"drive": id}; local file or earlier video code -> {"local": path}."""
     s = ref.strip().strip('"').strip("'")
     m = DRIVE_FILE_RE.search(s)
@@ -456,7 +476,7 @@ def _resolve_video_ref(ref: str) -> str | dict:
     if p.stat().st_size > MAX_REF_VIDEO_MB * 1024 * 1024:
         raise RefError(f"{p.name} is {p.stat().st_size / 2**20:.0f} MB; keep reference videos under "
                        f"{MAX_REF_VIDEO_MB} MB (shorter or 720p).")
-    if not _drive_ready():
+    if need_public and not _drive_ready():
         raise RefError("Seedance can only read videos from a public link. To use a local video, set up Google "
                        "Drive on the PC (setup_mobile.bat) so a temporary link can be made, or give a public URL.")
     return {"local": str(p), "label": str(p)}
@@ -575,7 +595,8 @@ def prepare_video(prompt: str, labels: list[str], files: list[tuple[str, bytes, 
                   image_mode: str = "auto", continue_from: str | None = None,
                   reference_videos: list[str] | None = None, task: str | None = None) -> VideoSpec:
     """Check a video request against what the chosen provider can do. Raises RefError."""
-    videos = [_resolve_video_ref(v) for v in (reference_videos or []) if v and v.strip()]
+    want_gemini = (provider or "").lower() == "gemini"
+    videos = [_resolve_video_ref(v, need_public=not want_gemini) for v in (reference_videos or []) if v and v.strip()]
     continued = None
     if continue_from:
         continued = _find_code(continue_from)
@@ -592,8 +613,17 @@ def prepare_video(prompt: str, labels: list[str], files: list[tuple[str, bytes, 
     if prov == "gemini":
         if continued and not continued.get("interaction_id"):
             raise RefError(f"{continue_from} was made by {continued.get('provider')}; continue it with that provider.")
+        if len(videos) > 1 or (videos and continued):
+            raise RefError("Gemini edits one video at a time: give one reference video, or continue_from, not both.")
+        if videos and not (isinstance(videos[0], dict) and "local" in videos[0]):
+            raise RefError("For Gemini, the reference video must be a local file or the code of an earlier video "
+                           "(it is uploaded to Gemini directly).")
         if videos:
-            raise RefError("Gemini does not take reference videos; use provider 'seedance'.")
+            dur = _video_seconds(Path(videos[0]["local"]))
+            if dur and dur > gemini.VIDEO_MAX_INPUT_SECONDS + 0.05:
+                raise RefError(f"Gemini edits clips of at most {gemini.VIDEO_MAX_INPUT_SECONDS}s "
+                               f"(this one is {dur:.1f}s). Trim it first.")
+            spec["task"] = task or "edit"
         if aspect_ratio not in GEMINI_RATIOS:
             raise RefError(f"Gemini video is 16:9 or 9:16 only (got {aspect_ratio}); use provider 'seedance'.")
         if resolution not in GEMINI_RESOLUTIONS:
@@ -640,8 +670,13 @@ async def render_video(spec: VideoSpec, request: str | None = None) -> tuple[byt
               "resolution": spec["resolution"], "continued_from": spec["continue_from"],
               "references": spec["labels"]}
     if prov == "gemini":
+        vids = []
+        for v in spec["videos"]:  # one local clip to edit
+            vp = Path(v["local"])
+            vids.append((vp.name, vp.read_bytes(),
+                         {".mov": "video/quicktime", ".webm": "video/webm"}.get(vp.suffix.lower(), "video/mp4")))
         data, interaction = await _render_video(spec["prompt"], spec["files"], spec["aspect_ratio"],
-                                                spec["resolution"], spec["previous"], spec["task"])
+                                                spec["resolution"], spec["previous"], spec["task"], vids)
         return data, {**common, "model": gemini.VIDEO_MODEL if BACKEND != "fake" else "fake",
                       "interaction_id": interaction}
 
@@ -822,6 +857,10 @@ Video (generate_video) — choose the provider per request
   mechanical design, proportions, joint layout and timing; only change materials, lighting and
   environment to ...". Local files go to Seedance through a temporary public Drive link that is removed
   afterwards; tell the user that once.
+- Gemini can also EDIT one of the user's own clips (<= 10 s): provider "gemini" + reference_videos=[local
+  path]. The clip is the source of truth for framing, motion and timing; the prompt says only what to
+  change (e.g. "make it photoreal ... keep everything else exactly the same"). Often the most faithful
+  option for restyling a playblast.
 - check_setup tests the keys and the Seedance connection without spending credit.
 - If a Seedance video FAILED with a network / timeout error, the task usually still finishes on
   BytePlus: call recover_video (no task id = newest unsaved task) instead of generating again. Returns the last frame as an image code too —
@@ -966,7 +1005,9 @@ async def generate_video(
                                                                     "playblast), the code of an earlier video, a "
                                                                     "Google Drive link, or a public http(s) URL. "
                                                                     "Local / Drive files get a temporary public Drive "
-                                                                    "link that is removed after the task.")] = None,
+                                                                    "link that is removed after the task. Gemini: "
+                                                                    "one local clip <= 10 s, edited directly (keeps "
+                                                                    "its framing and motion).")] = None,
     continue_from: Annotated[str | None, Field(description="Code of an earlier video from this server, to edit or "
                                                            "extend it. Stays with the provider that made it "
                                                            "(Seedance: within ~24h).")] = None,

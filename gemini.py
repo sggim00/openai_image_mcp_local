@@ -30,6 +30,8 @@ IMAGE_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "240"))
 VIDEO_TIMEOUT = float(os.environ.get("GEMINI_VIDEO_TIMEOUT", "900"))
 MAX_REFS = 14
 VIDEO_MAX_IMAGES = 3
+VIDEO_MAX_INPUT_SECONDS = 10  # uploaded clips for editing / extension
+VIDEO_INLINE_MAX = int(os.environ.get("GEMINI_VIDEO_INLINE_MAX", str(14 * 1024 * 1024)))
 
 # OpenAI-style size -> Gemini aspect ratio. A ratio string ("16:9") is passed straight through.
 SIZE_TO_ASPECT = {"1024x1024": "1:1", "1536x1024": "3:2", "1024x1536": "2:3"}
@@ -99,13 +101,47 @@ def aspect_for(size: str | None) -> str | None:
     return None
 
 
-def _input(prompt: str, images: list[tuple[str, bytes, str]]) -> list[dict] | str:
-    if not images:
+def _input(prompt: str, images: list[tuple[str, bytes, str]], videos: list[dict] | None = None) -> list[dict] | str:
+    if not images and not videos:
         return prompt
-    items: list[dict] = [{"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mime_type": mime}
-                         for _name, raw, mime in images]
+    items: list[dict] = list(videos or [])
+    items += [{"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mime_type": mime}
+              for _name, raw, mime in images]
     items.append({"type": "text", "text": prompt})
     return items
+
+
+async def video_item(name: str, raw: bytes, mime: str = "video/mp4") -> dict:
+    """An input video for editing: inline when small, otherwise uploaded through the Files API."""
+    if len(raw) <= VIDEO_INLINE_MAX:
+        return {"type": "video", "data": base64.b64encode(raw).decode("ascii"), "mime_type": mime}
+    upload = API.replace("/v1beta", "/upload/v1beta").replace("/v1alpha", "/upload/v1alpha")
+    key_headers = {"x-goog-api-key": _headers()["x-goog-api-key"]}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=30)) as c:
+        start = await c.post(f"{upload}/files", headers={
+            **key_headers, "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(len(raw)), "X-Goog-Upload-Header-Content-Type": mime,
+            "Content-Type": "application/json"}, json={"file": {"display_name": name}})
+        if start.status_code >= 400:
+            raise GeminiError("video upload: " + _error_text(start))
+        url = start.headers.get("x-goog-upload-url")
+        if not url:
+            raise GeminiError("video upload: no upload URL returned")
+        up = await c.post(url, headers={"X-Goog-Upload-Command": "upload, finalize", "X-Goog-Upload-Offset": "0",
+                                        "Content-Length": str(len(raw))}, content=raw)
+        if up.status_code >= 400:
+            raise GeminiError("video upload: " + _error_text(up))
+        f = up.json().get("file") or {}
+        deadline = time.time() + 300
+        while str(f.get("state", "ACTIVE")).upper() == "PROCESSING" and time.time() < deadline:
+            await asyncio.sleep(3)
+            g = await c.get(f"{API}/{f['name']}", headers=key_headers)
+            if g.status_code >= 400:
+                raise GeminiError("video upload: " + _error_text(g))
+            f = g.json()
+        if str(f.get("state", "ACTIVE")).upper() != "ACTIVE":
+            raise GeminiError(f"video upload: file state {f.get('state')}")
+        return {"type": "video", "uri": f["uri"], "mime_type": mime}
 
 
 def _media_items(obj, kind: str) -> list[dict]:
@@ -226,8 +262,8 @@ async def render_image(prompt: str, refs: list[tuple[str, bytes, str]], size: st
     if len(refs) > MAX_REFS:
         raise GeminiError(f"Gemini accepts at most {MAX_REFS} reference images (got {len(refs)}).")
     model = model or IMAGE_MODEL
-    fmt = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/png"}.get(output_format, "image/png")
-    rf: dict = {"type": "image", "mime_type": fmt, "image_size": QUALITY_TO_SIZE.get(quality, "1K")}
+    # The API only returns JPEG ('image/png' is rejected); server.py converts to the requested format.
+    rf: dict = {"type": "image", "mime_type": "image/jpeg", "image_size": QUALITY_TO_SIZE.get(quality, "1K")}
     aspect = aspect_for(size)
     if aspect:
         rf["aspect_ratio"] = aspect
@@ -244,14 +280,17 @@ async def render_image(prompt: str, refs: list[tuple[str, bytes, str]], size: st
 
 
 async def render_video(prompt: str, images: list[tuple[str, bytes, str]], aspect_ratio: str, resolution: str,
-                       previous_interaction_id: str | None = None, task: str | None = None) -> tuple[bytes, str]:
-    """Generate (or continue/edit) a short video. Returns (mp4 bytes, interaction id)."""
+                       previous_interaction_id: str | None = None, task: str | None = None,
+                       videos: list[tuple[str, bytes, str]] | None = None) -> tuple[bytes, str]:
+    """Generate (or continue/edit) a short video. `videos`: your own clip(s) to edit (<= 10 s).
+    Returns (mp4 bytes, interaction id)."""
     if len(images) > VIDEO_MAX_IMAGES:
         raise GeminiError(f"Video accepts at most {VIDEO_MAX_IMAGES} images (got {len(images)}).")
     rf: dict = {"type": "video", "aspect_ratio": aspect_ratio, "resolution": resolution}
     if resolution in ("1080p", "4k"):
         rf["delivery"] = "uri"  # inline base64 is meant for small files
-    body: dict = {"model": VIDEO_MODEL, "input": _input(prompt, images), "response_format": rf}
+    vitems = [await video_item(n, raw, mime) for n, raw, mime in (videos or [])]
+    body: dict = {"model": VIDEO_MODEL, "input": _input(prompt, images, vitems), "response_format": rf}
     if previous_interaction_id:
         body["previous_interaction_id"] = previous_interaction_id
     if task:
