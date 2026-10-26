@@ -68,7 +68,28 @@ _load_dotenv(HERE / ".env")
 import gemini  # noqa: E402  (reads its settings from the environment loaded above)
 import seedance  # noqa: E402
 
-VERSION = "2026.10.25-gemini-v2v"
+_MTIMES: dict[str, float] = {}
+
+
+def _hot_reload() -> None:
+    """Pick up edits to the backend modules (gemini.py, seedance.py) without restarting Claude.
+    Changes to server.py itself still need a restart."""
+    import importlib
+
+    for mod in (gemini, seedance):
+        try:
+            m = Path(mod.__file__).stat().st_mtime
+        except OSError:
+            continue
+        if _MTIMES.setdefault(mod.__name__, m) != m:
+            try:
+                importlib.reload(mod)
+                _MTIMES[mod.__name__] = m
+                log.info("reloaded %s", mod.__name__)
+            except Exception as e:  # keep the old code if the new file is broken
+                log.warning("could not reload %s: %s", mod.__name__, e)
+
+VERSION = "2026.10.27-gemini-v2v2"
 MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", "medium")
 BACKEND = os.environ.get("IMAGE_BACKEND", "openai")  # "openai" | "fake" (testing, no API calls)
@@ -918,6 +939,7 @@ async def generate_image(
     provider: Annotated[Provider, Field(description=ProviderDesc)] = "auto",
 ) -> list:
     """Create one image, optionally guided by reference images. Saves it locally and returns a preview, or a job id if still rendering."""
+    _hot_reload()
     try:
         labels, refs = await _load_refs(reference_images)
         prov = pick_provider(provider, "generate", len(refs), background)
@@ -939,6 +961,7 @@ async def generate_batch(
     provider: Annotated[Provider, Field(description=ProviderDesc)] = "auto",
 ) -> list:
     """Create several related images in parallel (e.g. every part of one character, or style variations)."""
+    _hot_reload()
     if not 1 <= len(prompts) <= MAX_BATCH:
         return [f"Give between 1 and {MAX_BATCH} prompts."]
     try:
@@ -964,6 +987,7 @@ async def edit_image(
     provider: Annotated[Provider, Field(description=ProviderDesc + " 'auto' uses Gemini for edits.")] = "auto",
 ) -> list:
     """Change an existing image while keeping the rest of it. Saves the result locally and returns a preview."""
+    _hot_reload()
     try:
         labels, refs = await _load_refs([image] + list(reference_images or []))
         prov = pick_provider(provider, "edit", len(refs), background)
@@ -1020,6 +1044,7 @@ async def generate_video(
     filename: Annotated[str | None, Field(description="Optional file name (no extension) for the .mp4.")] = None,
 ) -> list:
     """Make a short video with sound (Seedance or Gemini Omni; text and/or images in, .mp4 out), or edit/extend an earlier one."""
+    _hot_reload()
     try:
         labels, refs = await _load_refs(images)
         spec = prepare_video(prompt, labels, refs, provider=provider, aspect_ratio=aspect_ratio,
@@ -1073,6 +1098,7 @@ async def recover_video(
     filename: Annotated[str | None, Field(description="Optional file name (no extension) for the .mp4.")] = None,
 ) -> list:
     """Fetch a Seedance video whose wait was interrupted (network error, timeout, server restart) without paying again."""
+    _hot_reload()
     if BACKEND == "fake":
         return ["fake backend"]
     saved = {m.get("task_id") for m in _index_all() if m.get("task_id")}
@@ -1113,6 +1139,7 @@ async def recover_video(
 @mcp.tool()
 async def check_setup() -> str:
     """Check which providers work: API keys, a free Seedance connection test, Google Drive, server version."""
+    _hot_reload()
     key, src = _api_key()
     gkey, gsrc = gemini.api_key()
     lines = [

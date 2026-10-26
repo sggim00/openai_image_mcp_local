@@ -286,7 +286,9 @@ async def render_video(prompt: str, images: list[tuple[str, bytes, str]], aspect
     Returns (mp4 bytes, interaction id)."""
     if len(images) > VIDEO_MAX_IMAGES:
         raise GeminiError(f"Video accepts at most {VIDEO_MAX_IMAGES} images (got {len(images)}).")
-    rf: dict = {"type": "video", "aspect_ratio": aspect_ratio, "resolution": resolution}
+    rf: dict = {"type": "video", "resolution": resolution}
+    if not videos and task not in ("edit", "extend"):
+        rf["aspect_ratio"] = aspect_ratio  # edits / extensions inherit the input video's ratio (setting it is a 400)
     if resolution in ("1080p", "4k"):
         rf["delivery"] = "uri"  # inline base64 is meant for small files
     vitems = [await video_item(n, raw, mime) for n, raw, mime in (videos or [])]
@@ -295,7 +297,16 @@ async def render_video(prompt: str, images: list[tuple[str, bytes, str]], aspect
         body["previous_interaction_id"] = previous_interaction_id
     if task:
         body["generation_config"] = {"video_config": {"task": task}}
-    data = await _create(body, VIDEO_TIMEOUT)
+    try:
+        data = await _create(body, VIDEO_TIMEOUT)
+    except GeminiError as e:
+        # Edit mode may also refuse other output settings it inherits from the input; drop and retry once.
+        bad = [k for k in ("resolution", "aspect_ratio") if k in rf and k.split("_")[0] in str(e).lower()]
+        if not bad or "400" not in str(e):
+            raise
+        for k in bad:
+            rf.pop(k, None)
+        data = await _create(body, VIDEO_TIMEOUT)
     items = _media_items(data, "video")
     if not items:
         why = _texts(data)
